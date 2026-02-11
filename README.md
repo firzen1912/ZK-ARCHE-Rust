@@ -3,17 +3,17 @@
 Lightweight Schnorr Zero-Knowledge Mutual Authentication over
 Ristretto255.
 
+------------------------------------------------------------------------
+
 ## Overview
 
-This repository contains the Rust implementation of ZK-ARCHE, a
-lightweight elliptic curve--based mutual authentication framework
-designed for IoT and edge environments.
+Rust implementation of ZK-ARCHE, a lightweight elliptic-curve-based
+mutual authentication protocol for IoT and edge systems.
 
 ### Cryptographic Design
 
 -   Group: Ristretto255 (prime-order abstraction over Curve25519)
--   Proof System: Schnorr Zero-Knowledge Proof (Fiat--Shamir
-    transformed)
+-   Proof System: Schnorr ZKP (Fiat--Shamir)
 -   Transcript: Deterministic C-compatible transcript
 -   Hash: SHA-512 (challenge derivation)
 -   KDF: HKDF-SHA256
@@ -21,68 +21,82 @@ designed for IoT and edge environments.
 
 ------------------------------------------------------------------------
 
-## Requirements
+## 1. Install Dependencies (Ubuntu / Raspberry Pi OS)
 
-Ubuntu / Raspberry Pi OS:
-
-sudo apt update\
-sudo apt install build-essential pkg-config git
+``` bash
+sudo apt update
+sudo apt install build-essential pkg-config git curl
+```
 
 Install Rust:
 
-curl https://sh.rustup.rs -sSf \| sh\
-source \~/.cargo/env\
+``` bash
+curl https://sh.rustup.rs -sSf | sh
+source ~/.cargo/env
 rustup update
+```
 
 ------------------------------------------------------------------------
 
-## Build
+## 2. Build
 
+``` bash
 cargo build --release
+```
 
-Binaries:
+Binaries will be in:
 
-target/release/client\
-target/release/server
+    target/release/client
+    target/release/server
 
 ------------------------------------------------------------------------
 
-## Run Server
+## 3. Run Server
 
+``` bash
 cargo run --release --bin server -- --bind 0.0.0.0:4000 --pairing
+```
 
-Options:
+Optional arguments:
 
---bind `<IP:PORT>`{=html}\
---pairing\
---pairing-token `<TOKEN>`{=html}\
---pairing-seconds `<SECONDS>`{=html}
+``` bash
+--bind <IP:PORT>
+--pairing
+--pairing-token <TOKEN>
+--pairing-seconds <SECONDS>
+```
 
 ------------------------------------------------------------------------
 
-## Provisioning (SETUP)
+## 4. Provision Device (SETUP)
 
+``` bash
 cargo run --release --bin client -- --server 127.0.0.1:4000 --setup
+```
 
 Creates:
 
-device_id.bin\
-device_x.bin
+    device_id.bin
+    device_x.bin
 
 ------------------------------------------------------------------------
 
-## Authentication (AUTH)
+## 5. Authenticate (AUTH)
 
+``` bash
 cargo run --release --bin client -- --server 127.0.0.1:4000
+```
 
 ------------------------------------------------------------------------
 
-## Reset
+## 6. Reset Environment
 
+``` bash
 rm -f device_id.bin device_x.bin registry.bin registry.bak
+```
 
 ------------------------------------------------------------------------
 
-## Research Prototype Notice
+## Research Notice
 
-For research and academic evaluation only. Not production hardened.
+Research prototype. Not production hardened.
