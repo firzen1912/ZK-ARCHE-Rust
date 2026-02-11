@@ -38,32 +38,32 @@ rustup update
 
 ------------------------------------------------------------------------
 
-## 2. Build
+## 2. Compile (Release Build)
 
 ``` bash
 cargo build --release
 ```
 
-Binaries will be in:
+Compiled binaries:
 
-    target/release/client
-    target/release/server
+``` bash
+./target/release/client
+./target/release/server
+```
+
+You may also compile and run in one step:
+
+``` bash
+cargo run --release --bin server
+cargo run --release --bin client
+```
 
 ------------------------------------------------------------------------
 
 ## 3. Run Server
 
 ``` bash
-cargo run --release --bin server -- --bind 0.0.0.0:4000 --pairing
-```
-
-Optional arguments:
-
-``` bash
---bind <IP:PORT>
---pairing
---pairing-token <TOKEN>
---pairing-seconds <SECONDS>
+./target/release/server --bind 0.0.0.0:4000 --pairing
 ```
 
 ------------------------------------------------------------------------
@@ -71,20 +71,15 @@ Optional arguments:
 ## 4. Provision Device (SETUP)
 
 ``` bash
-cargo run --release --bin client -- --server 127.0.0.1:4000 --setup
+./target/release/client --server 127.0.0.1:4000 --setup
 ```
-
-Creates:
-
-    device_id.bin
-    device_x.bin
 
 ------------------------------------------------------------------------
 
 ## 5. Authenticate (AUTH)
 
 ``` bash
-cargo run --release --bin client -- --server 127.0.0.1:4000
+./target/release/client --server 127.0.0.1:4000
 ```
 
 ------------------------------------------------------------------------
