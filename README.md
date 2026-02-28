@@ -54,8 +54,8 @@ Compiled binaries:
 You may also compile and run in one step:
 
 ``` bash
-cargo run --release --bin server
-cargo run --release --bin client
+cargo build --release --bin server
+cargo build --release --bin client
 ```
 
 ------------------------------------------------------------------------

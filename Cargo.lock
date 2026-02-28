@@ -230,6 +230,7 @@ dependencies = [
  "curve25519-dalek",
  "hex",
  "hkdf",
+ "hmac",
  "merlin",
  "rand",
  "sha2",

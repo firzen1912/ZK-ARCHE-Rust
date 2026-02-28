@@ -1,3 +1,6 @@
 /target
 device_id.bin
 device_x.bin
+server_pub.bin
+server_sk.bin
+registry.bin
