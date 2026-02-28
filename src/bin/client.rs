@@ -1,43 +1,59 @@
 // ==============================
-// client.rs (C-COMPATIBLE TRANSCRIPT, NO MERLIN)
+// client.rs (DESIGN A: TOFU pin server pubkey + KEY CONFIRMATION MACs)
 // ==============================
 //
-// Wire protocol (1-byte msg_type):
-//   MSG_SETUP = 0x01
-//     C->S: 0x01 | token_len(u8)=0 | device_id(32) | static_pub(32)
-//     S->C: server_nonce(32)
-//     C->S: A(32) | s(32)          (Schnorr PoP bound to device_id + server_nonce)
+// Goals:
+//   1) Record server identity during provisioning (SETUP) using TOFU pinning of server_static_pub.
+//   2) Enforce pinned server_static_pub during AUTH (reject MITM / wrong server).
+//   3) Add key confirmation MACs: "server finished" and "client finished".
 //
-//   MSG_AUTH  = 0x02
-//     C->S: 0x02 | device_id(32) | A(32) | s(32) | nonce_c(32) | eph_c(32)
-//     S->C:       server_static_pub(32) | A_s(32) | s_s(32) | nonce_s(32) | eph_s(32)
-//
-// Files (client):
-//   device_id.bin (32 bytes)
-//   device_x.bin  (32 bytes scalar)
-//
-// NOTE: This version replaces merlin::Transcript with a C-compatible transcript:
+// C-compat transcript (NO merlin):
 //   domain_len(u8)||domain
 //   for each field: label_len(u8)||label||value_len(u32 LE)||value
 //   challenge scalar: c = Scalar::from_bytes_mod_order_wide(SHA512(transcript))
 //
-// This MUST match the C implementation's transcript to interoperate.
+// Wire protocol (1-byte msg_type):
+//   MSG_SETUP = 0x01
+//     C->S: 0x01 | token_len(u8)=0 | device_id(32) | device_static_pub(32)
+//     S->C: server_static_pub(32) | server_nonce(32)         [UPDATED]
+//     C->S: A(32) | s(32)     (Schnorr PoP over device key, bound to device_id + device_pub + A + server_nonce)
 //
-
+//   MSG_AUTH  = 0x02
+//     C->S: 0x02 | device_id(32) | A(32) | s(32) | nonce_c(32) | eph_c(32)
+//     S->C: server_static_pub(32) | A_s(32) | s_s(32) | nonce_s(32) | eph_s(32) | tag_s(32)   [UPDATED]
+//     C->S: tag_c(32)                                                                    [UPDATED]
+//
+// Files (client):
+//   device_id.bin   (32 bytes)
+//   device_x.bin    (32 bytes scalar)
+//   server_pub.bin  (32 bytes compressed Ristretto)  <-- pinned server identity (TOFU)
+//
+// Dependencies (Cargo.toml):
+//   curve25519-dalek = "4"
+//   rand = "0.8"
+//   sha2 = "0.10"
+//   hkdf = "0.12"
+//   hmac = "0.12"
+//   hex = "0.4"
+//   zeroize = "1"
+//
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256, Sha512};
 use zeroize::Zeroize;
+
+type HmacSha256 = Hmac<Sha256>;
 
 const DEVICE_ID_LEN: usize = 32;
 const NONCE_LEN: usize = 32;
@@ -47,6 +63,16 @@ const MSG_AUTH: u8 = 0x02;
 
 const DEVICE_ID_FILE: &str = "device_id.bin";
 const DEVICE_X_FILE: &str = "device_x.bin";
+const SERVER_PUB_FILE: &str = "server_pub.bin";
+
+// Transcript domains (versioned; must match server and C if you interop)
+const T_SETUP: &[u8] = b"setup_schnorr_v1";
+const T_CLIENT: &[u8] = b"client_schnorr_v1";
+const T_SERVER: &[u8] = b"server_schnorr_v1";
+const T_KC: &[u8] = b"kc_v1";
+
+// Networking hardening
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ----------------------------------------------------
 // C-compatible transcript (replaces merlin::Transcript)
@@ -99,7 +125,23 @@ fn random_bytes_32() -> [u8; 32] {
     b
 }
 
-// Setup proof-of-possession (PoP): binds device_id + pubkey + A + server_nonce
+/// Reject identity points (hardening).
+fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
+    if *p == RistrettoPoint::default() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} is identity"),
+        ));
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------
+// Schnorr proofs
+// ----------------------------------------------------
+
+/// Setup proof-of-possession (PoP): binds device_id + device_pub + A + server_nonce.
+/// This demonstrates the client actually controls x corresponding to device_pub.
 fn schnorr_prove_setup(
     x: &Scalar,
     device_id: &[u8; 32],
@@ -109,7 +151,7 @@ fn schnorr_prove_setup(
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
 
-    let mut t = CompatTranscript::new(b"setup_schnorr");
+    let mut t = CompatTranscript::new(T_SETUP);
     t.append_message(b"device_id", device_id);
     t.append_message(b"pubkey", pubkey.compress().as_bytes());
     t.append_message(b"a", a.compress().as_bytes());
@@ -120,19 +162,19 @@ fn schnorr_prove_setup(
     (a, s)
 }
 
-// Auth proof: binds device_id + expected pubkey + A + nonce_c + eph_c
+/// Auth proof: binds device_id + expected pubkey + A + nonce_c + eph_c.
+/// This proves the connecting party still controls the registered static secret x.
 fn schnorr_prove_auth(
     x: &Scalar,
     device_id: &[u8; 32],
     nonce_c: &[u8; 32],
     eph_c: &RistrettoPoint,
-    label: &'static [u8], // must be b"client_schnorr"
 ) -> (RistrettoPoint, Scalar) {
     let pubkey = RISTRETTO_BASEPOINT_POINT * x;
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
 
-    let mut t = CompatTranscript::new(label);
+    let mut t = CompatTranscript::new(T_CLIENT);
     t.append_message(b"device_id", device_id);
     t.append_message(b"pubkey", pubkey.compress().as_bytes());
     t.append_message(b"a", a.compress().as_bytes());
@@ -144,17 +186,17 @@ fn schnorr_prove_auth(
     (a, s)
 }
 
+/// Verify server Schnorr proof: binds server_pub + A_s + nonce_s + eph_s.
+/// NOTE: With Design A, we don’t need a hardcoded SERVER_ID. The server identity is its pinned pubkey.
 fn schnorr_verify_server(
     server_static_pub: &RistrettoPoint,
     a: &RistrettoPoint,
     s: &Scalar,
-    server_id: &[u8; 32],
     nonce_s: &[u8; 32],
     eph_s: &RistrettoPoint,
-    label: &'static [u8], // must be b"server_schnorr"
 ) -> bool {
-    let mut t = CompatTranscript::new(label);
-    t.append_message(b"server_id", server_id);
+    let mut t = CompatTranscript::new(T_SERVER);
+    // We bind the server pubkey explicitly.
     t.append_message(b"pubkey", server_static_pub.compress().as_bytes());
     t.append_message(b"a", a.compress().as_bytes());
     t.append_message(b"nonce_s", nonce_s);
@@ -164,6 +206,13 @@ fn schnorr_verify_server(
     RISTRETTO_BASEPOINT_POINT * s == a + server_static_pub * c
 }
 
+// ----------------------------------------------------
+// Session key derivation (same as your original)
+// ----------------------------------------------------
+/// HKDF derivation:
+///   shared = peer_eph_pub * eph_secret
+///   salt   = nonce_c || nonce_s
+///   info   = "session key" || device_id || eph_c || eph_s
 fn derive_session_key(
     eph_secret: &Scalar,
     peer_eph_pub: &RistrettoPoint,
@@ -176,12 +225,10 @@ fn derive_session_key(
     let shared = peer_eph_pub * eph_secret;
     let shared_bytes = shared.compress().to_bytes();
 
-    // salt = nonce_c || nonce_s
     let mut salt = [0u8; 64];
     salt[..32].copy_from_slice(nonce_c);
     salt[32..].copy_from_slice(nonce_s);
 
-    // info = "session key" || device_id || eph_c || eph_s
     let mut info = Vec::with_capacity(11 + 32 + 32 + 32);
     info.extend_from_slice(b"session key"); // 11 bytes
     info.extend_from_slice(device_id);
@@ -192,6 +239,68 @@ fn derive_session_key(
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).unwrap();
     okm
+}
+
+// ----------------------------------------------------
+// Key confirmation (KC): transcript hash + HMACs
+// ----------------------------------------------------
+
+/// Compute a transcript hash that both sides can reproduce.
+/// We use CompatTranscript for deterministic binary encoding, then SHA-256 of the transcript buffer.
+fn kc_transcript_hash(
+    device_id: &[u8; 32],
+    a_c: &RistrettoPoint,
+    s_c: &Scalar,
+    nonce_c: &[u8; 32],
+    eph_c: &RistrettoPoint,
+    server_pub: &RistrettoPoint,
+    a_s: &RistrettoPoint,
+    s_s: &Scalar,
+    nonce_s: &[u8; 32],
+    eph_s: &RistrettoPoint,
+) -> [u8; 32] {
+    let mut t = CompatTranscript::new(T_KC);
+    t.append_message(b"device_id", device_id);
+    t.append_message(b"a_c", a_c.compress().as_bytes());
+    t.append_message(b"s_c", &s_c.to_bytes());
+    t.append_message(b"nonce_c", nonce_c);
+    t.append_message(b"eph_c", eph_c.compress().as_bytes());
+    t.append_message(b"server_pub", server_pub.compress().as_bytes());
+    t.append_message(b"a_s", a_s.compress().as_bytes());
+    t.append_message(b"s_s", &s_s.to_bytes());
+    t.append_message(b"nonce_s", nonce_s);
+    t.append_message(b"eph_s", eph_s.compress().as_bytes());
+
+    let mut h = Sha256::new();
+    h.update(&t.buf);
+    let out = h.finalize();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out);
+    r
+}
+
+/// Derive separate KC keys from the session key.
+/// This avoids reusing the raw session key directly for MACing.
+fn derive_kc_keys(session_key: &[u8; 32], th: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let hk = Hkdf::<Sha256>::new(Some(th), session_key);
+
+    let mut k_s2c = [0u8; 32];
+    let mut k_c2s = [0u8; 32];
+
+    hk.expand(b"kc s2c", &mut k_s2c).unwrap();
+    hk.expand(b"kc c2s", &mut k_c2s).unwrap();
+
+    (k_s2c, k_c2s)
+}
+
+fn hmac_tag(key: &[u8; 32], label: &[u8], th: &[u8; 32]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key size ok");
+    mac.update(label);
+    mac.update(th);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&out);
+    tag
 }
 
 // ----------------------------------------------------
@@ -223,10 +332,7 @@ fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scal
     if ct.is_some().unwrap_u8() == 1 {
         Ok(ct.unwrap())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid scalar",
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid scalar"))
     }
 }
 
@@ -235,7 +341,7 @@ fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scal
 // ----------------------------------------------------
 fn load_device_creds() -> std::io::Result<([u8; 32], Scalar)> {
     let id_bytes = fs::read(DEVICE_ID_FILE)?;
-    if id_bytes.len() != 32 {
+    if id_bytes.len() != DEVICE_ID_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "device_id.bin wrong length",
@@ -275,6 +381,35 @@ fn creds_exist() -> bool {
 }
 
 // ----------------------------------------------------
+// Server pubkey pinning (TOFU)
+// ----------------------------------------------------
+fn load_server_pub() -> std::io::Result<Option<RistrettoPoint>> {
+    if !Path::new(SERVER_PUB_FILE).exists() {
+        return Ok(None);
+    }
+    let b = fs::read(SERVER_PUB_FILE)?;
+    if b.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server_pub.bin wrong length",
+        ));
+    }
+    let mut bb = [0u8; 32];
+    bb.copy_from_slice(&b);
+
+    let p = CompressedRistretto(bb)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server_pub.bin invalid point"))?;
+    reject_identity(&p, "pinned server_pub")?;
+    Ok(Some(p))
+}
+
+fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
+    fs::write(SERVER_PUB_FILE, pubkey.compress().as_bytes())?;
+    Ok(())
+}
+
+// ----------------------------------------------------
 // SETUP (provisioning handshake)
 // ----------------------------------------------------
 fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
@@ -282,32 +417,58 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
     let mut recv = 0usize;
 
     let mut stream = TcpStream::connect(server_addr)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
     println!("Client[SETUP]: Connected to {}", server_addr);
 
     // msg_type
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
 
-    // token_len(u8) = 0 (matches your server behavior)
+    // token_len(u8) = 0 (kept for C-compat; if you want a token, extend this)
     send_all(&mut stream, &[0u8], &mut sent)?;
 
-    // send device_id + static_pub
-    let static_pub = RISTRETTO_BASEPOINT_POINT * x;
+    // send device_id + device_static_pub
+    let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
+    reject_identity(&device_static_pub, "client device_static_pub")?;
+
     send_all(&mut stream, &device_id, &mut sent)?;
-    send_all(&mut stream, static_pub.compress().as_bytes(), &mut sent)?;
+    send_all(&mut stream, device_static_pub.compress().as_bytes(), &mut sent)?;
     stream.flush()?;
 
-    // recv server_nonce
+    // recv server_static_pub + server_nonce  [UPDATED]
+    let server_static_pub = recv_point(&mut stream, &mut recv)?;
+    reject_identity(&server_static_pub, "server_static_pub")?;
+
     let mut server_nonce = [0u8; 32];
     recv_exact(&mut stream, &mut server_nonce, &mut recv)?;
 
-    // prove possession
+    // TOFU pinning: if no pinned server, store it now; else enforce match
+    match load_server_pub()? {
+        None => {
+            println!("Client[SETUP]: Pinning server pubkey (TOFU) to {}", SERVER_PUB_FILE);
+            save_server_pub(&server_static_pub)?;
+        }
+        Some(pinned) => {
+            if pinned.compress().to_bytes() != server_static_pub.compress().to_bytes() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "server pubkey mismatch vs pinned (refuse setup)",
+                ));
+            }
+            println!("Client[SETUP]: Server pubkey matches pinned value.");
+        }
+    }
+
+    // prove possession of device key
     let (a, s) = schnorr_prove_setup(&x, &device_id, &server_nonce);
     send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
     send_all(&mut stream, &s.to_bytes(), &mut sent)?;
     stream.flush()?;
 
     println!(
-        "Client[SETUP]: Sent={} bytes, Received={} bytes. Registered device_id={}",
+        "Client[SETUP]: Sent={} bytes, Received={} bytes. Enrolled device_id={}",
         sent,
         recv,
         hex::encode(device_id)
@@ -318,56 +479,72 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
 }
 
 // ----------------------------------------------------
-// AUTH (normal handshake)
+// AUTH (normal handshake) + KC MACs
 // ----------------------------------------------------
-
-// Demo constant server identity binding (matches C).
-static SERVER_ID: [u8; 32] = [0x53u8; 32];
-
 fn do_auth(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv = 0usize;
 
+    // Must have pinned server identity to proceed (Design A)
+    let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no pinned server_pub.bin; run client --setup first",
+        )
+    })?;
+
     let mut stream = TcpStream::connect(server_addr)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
     println!("Client[AUTH]: Connected to {}", server_addr);
 
-    let mut nonce_c = [0u8; 32];
+    // Client nonce + ephemeral ECDH key
+    let mut nonce_c = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_c);
 
     let mut eph_secret = random_scalar();
     let eph_pub = RISTRETTO_BASEPOINT_POINT * eph_secret;
+    reject_identity(&eph_pub, "client eph_pub")?;
 
-    // msg_type + identity-bound proof
-    let (a, s) = schnorr_prove_auth(&x, &device_id, &nonce_c, &eph_pub, b"client_schnorr");
+    // Client Schnorr auth proof over static x
+    let (a_c, s_c) = schnorr_prove_auth(&x, &device_id, &nonce_c, &eph_pub);
 
+    // Send AUTH request
     send_all(&mut stream, &[MSG_AUTH], &mut sent)?;
     send_all(&mut stream, &device_id, &mut sent)?;
-    send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
-    send_all(&mut stream, &s.to_bytes(), &mut sent)?;
+    send_all(&mut stream, a_c.compress().as_bytes(), &mut sent)?;
+    send_all(&mut stream, &s_c.to_bytes(), &mut sent)?;
     send_all(&mut stream, &nonce_c, &mut sent)?;
     send_all(&mut stream, eph_pub.compress().as_bytes(), &mut sent)?;
     stream.flush()?;
 
-    // recv server response
+    // Receive server response
     let server_static_pub = recv_point(&mut stream, &mut recv)?;
-    let server_a = recv_point(&mut stream, &mut recv)?;
-    let server_s = recv_scalar(&mut stream, &mut recv)?;
-    let mut nonce_s = [0u8; 32];
-    recv_exact(&mut stream, &mut nonce_s, &mut recv)?;
-    let eph_s = recv_point(&mut stream, &mut recv)?;
+    reject_identity(&server_static_pub, "server_static_pub")?;
 
-    // verify server
-    let ok = schnorr_verify_server(
-        &server_static_pub,
-        &server_a,
-        &server_s,
-        &SERVER_ID,
-        &nonce_s,
-        &eph_s,
-        b"server_schnorr",
-    );
-    println!("Client[AUTH]: Server authentication = {}", ok);
+    // Enforce pinned server identity
+    if server_static_pub.compress().to_bytes() != pinned_server_pub.compress().to_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server pubkey mismatch vs pinned (refuse auth)",
+        ));
+    }
+
+    let a_s = recv_point(&mut stream, &mut recv)?;
+    let s_s = recv_scalar(&mut stream, &mut recv)?;
+
+    let mut nonce_s = [0u8; NONCE_LEN];
+    recv_exact(&mut stream, &mut nonce_s, &mut recv)?;
+
+    let eph_s = recv_point(&mut stream, &mut recv)?;
+    reject_identity(&eph_s, "server eph_s")?;
+
+    // Verify server Schnorr proof using pinned pubkey
+    let ok = schnorr_verify_server(&server_static_pub, &a_s, &s_s, &nonce_s, &eph_s);
+    println!("Client[AUTH]: Server Schnorr authentication = {}", ok);
     if !ok {
         eprintln!("Client[AUTH]: Authentication FAILED");
         x.zeroize();
@@ -375,17 +552,45 @@ fn do_auth(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Re
         return Ok(());
     }
 
-    let key = derive_session_key(
-        &eph_secret,
-        &eph_s,
-        &nonce_c,
-        &nonce_s,
+    // Derive session key
+    let session_key = derive_session_key(&eph_secret, &eph_s, &nonce_c, &nonce_s, &device_id, &eph_pub, &eph_s);
+    println!("Client[AUTH]: Session key = {}", hex::encode(session_key));
+
+    // -------- Key Confirmation (KC) --------
+    // Receive tag_s then verify, then send tag_c.
+    let mut tag_s = [0u8; 32];
+    recv_exact(&mut stream, &mut tag_s, &mut recv)?;
+
+    let th = kc_transcript_hash(
         &device_id,
+        &a_c,
+        &s_c,
+        &nonce_c,
         &eph_pub,
+        &server_static_pub,
+        &a_s,
+        &s_s,
+        &nonce_s,
         &eph_s,
     );
-    println!("Client[AUTH]: Session key = {}", hex::encode(key));
 
+    let (k_s2c, k_c2s) = derive_kc_keys(&session_key, &th);
+
+    let expected_tag_s = hmac_tag(&k_s2c, b"server finished", &th);
+    if expected_tag_s != tag_s {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server key confirmation failed (tag_s mismatch)",
+        ));
+    }
+    println!("Client[AUTH]: Key confirmation (server finished) OK");
+
+    let tag_c = hmac_tag(&k_c2s, b"client finished", &th);
+    send_all(&mut stream, &tag_c, &mut sent)?;
+    stream.flush()?;
+    println!("Client[AUTH]: Sent client finished tag");
+
+    // Cleanup secrets
     x.zeroize();
     eph_secret.zeroize();
 
