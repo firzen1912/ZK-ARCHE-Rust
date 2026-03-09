@@ -51,9 +51,8 @@ const NONCE_LEN: usize = 32;
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03; // Bumped to 0x03 for encrypted tunnel
 
-const DEVICE_ID_FILE: &str = "device_id.bin";
-const DEVICE_X_FILE: &str = "device_x.bin";
-const SERVER_PUB_FILE: &str = "server_pub.bin";
+const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/device_root.bin";
+const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/server_pub.bin";
 
 // Transcript domains (versioned; must match server and C if you interop)
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
@@ -297,38 +296,67 @@ fn recv_point(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Ristr
 }
 
 // ----------------------------------------------------
-// Local credential storage (simple demo)
+// Local credential storage (root-secret model)
 // ----------------------------------------------------
-fn load_device_creds() -> std::io::Result<([u8; 32], Scalar)> {
-    let id_bytes = fs::read(DEVICE_ID_FILE)?;
-    if id_bytes.len() != DEVICE_ID_LEN {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "device_id wrong length"));
+fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        fs::create_dir_all(parent)?;
     }
-    let mut device_id = [0u8; 32];
-    device_id.copy_from_slice(&id_bytes);
-
-    let x_bytes = fs::read(DEVICE_X_FILE)?;
-    if x_bytes.len() != 32 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "device_x wrong length"));
-    }
-    let mut xb = [0u8; 32];
-    xb.copy_from_slice(&x_bytes);
-
-    let ct = Scalar::from_canonical_bytes(xb);
-    if ct.is_some().unwrap_u8() != 1 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "device_x not canonical"));
-    }
-    Ok((device_id, ct.unwrap()))
-}
-
-fn save_device_creds(device_id: &[u8; 32], x: &Scalar) -> std::io::Result<()> {
-    fs::write(DEVICE_ID_FILE, device_id)?;
-    fs::write(DEVICE_X_FILE, x.to_bytes())?;
     Ok(())
 }
 
+fn load_or_create_device_root() -> std::io::Result<[u8; 32]> {
+    if Path::new(DEVICE_ROOT_FILE).exists() {
+        let b = fs::read(DEVICE_ROOT_FILE)?;
+        if b.len() != 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "device_root wrong length",
+            ));
+        }
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&b);
+        Ok(root)
+    } else {
+        ensure_parent_dir(DEVICE_ROOT_FILE)?;
+        let root = random_bytes_32();
+        fs::write(DEVICE_ROOT_FILE, root)?;
+        Ok(root)
+    }
+}
+
+fn derive_device_id(root: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, b"device-id");
+    sha2::Digest::update(&mut h, root);
+    let out = h.finalize();
+
+    let mut device_id = [0u8; 32];
+    device_id.copy_from_slice(&out);
+    device_id
+}
+
+fn derive_device_scalar(root: &[u8; 32]) -> Scalar {
+    let mut h = Sha512::new();
+    sha2::Digest::update(&mut h, b"device-auth-v1");
+    sha2::Digest::update(&mut h, root);
+    let digest = h.finalize();
+
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&digest);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+fn load_device_creds_from_root() -> std::io::Result<([u8; 32], Scalar)> {
+    let mut root = load_or_create_device_root()?;
+    let device_id = derive_device_id(&root);
+    let x = derive_device_scalar(&root);
+    root.zeroize();
+    Ok((device_id, x))
+}
+
 fn creds_exist() -> bool {
-    Path::new(DEVICE_ID_FILE).exists() && Path::new(DEVICE_X_FILE).exists()
+    Path::new(DEVICE_ROOT_FILE).exists()
 }
 
 // ----------------------------------------------------
@@ -607,25 +635,24 @@ fn main() -> std::io::Result<()> {
     }
 
     if !creds_exist() && !do_setup_flag {
-        eprintln!("Client: device creds missing ({} / {}). Refusing AUTH. Run with --setup to enroll.", DEVICE_ID_FILE, DEVICE_X_FILE);
+        eprintln!(
+            "Client: device root missing ({}). Refusing AUTH. Run with --setup to enroll.",
+            DEVICE_ROOT_FILE
+        );
         return Ok(());
     }
 
     if do_setup_flag {
-        let (device_id, x) = if creds_exist() {
-            println!("Client[SETUP]: Using existing creds for setup (idempotent).");
-            load_device_creds()?
+        if creds_exist() {
+            println!("Client[SETUP]: Using existing device root for setup (idempotent).");
         } else {
-            println!("Client[SETUP]: No creds found; generating NEW device identity (re-enroll).");
-            let device_id = random_bytes_32();
-            let x = random_scalar();
-            save_device_creds(&device_id, &x)?;
-            (device_id, x)
-        };
+            println!("Client[SETUP]: No device root found; generating NEW device root (re-enroll).");
+        }
+        let (device_id, x) = load_device_creds_from_root()?;
         do_setup(&server_addr, device_id, x)?;
         return Ok(());
     }
 
-    let (device_id, x) = load_device_creds()?;
+    let (device_id, x) = load_device_creds_from_root()?;
     do_auth_v2(&server_addr, device_id, x)
 }
