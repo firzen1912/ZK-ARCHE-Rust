@@ -55,6 +55,10 @@ const MSG_AUTH_V2: u8 = 0x03; // Bumped to 0x03 for encrypted tunnel
 const REGISTRY_BIN: &str = "registry.bin";
 const REGISTRY_BAK: &str = "registry.bak";
 const SERVER_SK_FILE: &str = "server_sk.bin";
+const BOOTSTRAP_DB_FILE: &str = "bootstrap_registry.bin";
+const BOOTSTRAP_DB_BAK: &str = "bootstrap_registry.bak";
+const BOOTSTRAP_ID_LEN: usize = 32;
+const BOOTSTRAP_SECRET_LEN: usize = 32;
 
 // Transcript domains (versioned; must match client and C if interop)
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
@@ -358,6 +362,97 @@ fn save_registry_atomic(
     Ok(())
 }
 
+#[derive(Clone)]
+struct BootstrapRecord {
+    secret: [u8; 32],
+}
+
+fn load_bootstrap_db(path: &str) -> std::io::Result<HashMap<[u8; 32], BootstrapRecord>> {
+    let mut db = HashMap::new();
+    let data = fs::read(path).unwrap_or_default();
+    for chunk in data.chunks_exact(64) {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&chunk[0..32]);
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&chunk[32..64]);
+        db.insert(id, BootstrapRecord { secret });
+    }
+    Ok(db)
+}
+
+fn save_bootstrap_db_atomic(
+    path: &str,
+    bak_path: &str,
+    db: &HashMap<[u8; 32], BootstrapRecord>,
+) -> std::io::Result<()> {
+    if Path::new(path).exists() {
+        let _ = fs::copy(path, bak_path);
+    }
+    let tmp = format!("{}.tmp", path);
+    let mut out = Vec::with_capacity(db.len() * 64);
+    for (id, rec) in db {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&rec.secret);
+    }
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn ztp_mac_transcript(
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut t = CompatTranscript::new(b"ztp-bootstrap-v1");
+    t.append_message(b"bootstrap_id", bootstrap_id);
+    t.append_message(b"device_id", device_id);
+    t.append_message(b"device_pub", device_static_pub.compress().as_bytes());
+    t.append_message(b"server_pub", server_static_pub.compress().as_bytes());
+    t.append_message(b"client_nonce", client_nonce);
+    t.append_message(b"server_nonce", server_nonce);
+
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, &t.buf);
+    let out = h.finalize();
+    let mut th = [0u8; 32];
+    th.copy_from_slice(&out);
+    th
+}
+
+fn compute_bootstrap_mac(
+    bootstrap_secret: &[u8; BOOTSTRAP_SECRET_LEN],
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let th = ztp_mac_transcript(
+        bootstrap_id,
+        device_id,
+        device_static_pub,
+        server_static_pub,
+        client_nonce,
+        server_nonce,
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(bootstrap_secret).expect("HMAC key size ok");
+    mac.update(b"ztp-bootstrap-mac");
+    mac.update(&th);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&out);
+    tag
+}
+
 fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
     if Path::new(path).exists() {
         let b = fs::read(path)?;
@@ -417,7 +512,7 @@ struct PairingPolicy {
 }
 
 impl PairingPolicy {
-    fn allows_setup(&self, token_seen: Option<&str>) -> bool {
+    fn allows_ztp_setup(&self) -> bool {
         if !self.enabled {
             return false;
         }
@@ -426,26 +521,18 @@ impl PairingPolicy {
                 return false;
             }
         }
-        match (&self.token, token_seen) {
-            (None, _) => true,
-            (Some(expected), Some(got)) => expected == got,
-            (Some(_), None) => false,
-        }
+        true
     }
 }
 
-fn recv_setup_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Option<String>> {
+fn recv_bootstrap_id(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<[u8; BOOTSTRAP_ID_LEN]> {
     let len = recv_u8(stream, recv)?;
-    if len == 0 {
-        return Ok(None);
+    if len as usize != BOOTSTRAP_ID_LEN {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bootstrap_id wrong length"));
     }
-    if len > 64 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "token too long"));
-    }
-    let mut b = vec![0u8; len as usize];
-    recv_exact(stream, &mut b, recv)?;
-    let s = String::from_utf8(b).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "token not utf8"))?;
-    Ok(Some(s))
+    let mut id = [0u8; BOOTSTRAP_ID_LEN];
+    recv_exact(stream, &mut id, recv)?;
+    Ok(id)
 }
 
 // ----------------------------------------------------
@@ -457,17 +544,33 @@ fn handle_setup(
     policy: &PairingPolicy,
     server_static_pub: &RistrettoPoint,
     reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
+    bootstrap_db: &Arc<RwLock<HashMap<[u8; 32], BootstrapRecord>>>,
     sent: &mut usize,
     recv: &mut usize,
 ) -> std::io::Result<()> {
-    let token_seen = recv_setup_token(stream, recv)?;
-    if !policy.allows_setup(token_seen.as_deref()) {
+    if !policy.allows_ztp_setup() {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "pairing not allowed"));
     }
+
+    let bootstrap_id = recv_bootstrap_id(stream, recv)?;
+    let bootstrap_secret = {
+        let db_r = bootstrap_db.read().unwrap();
+        match db_r.get(&bootstrap_id) {
+            Some(rec) => rec.secret,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unknown bootstrap_id",
+                ))
+            }
+        }
+    };
 
     let device_id = recv_device_id(stream, recv)?;
     let device_static_pub = recv_point(stream, recv)?;
     reject_identity(&device_static_pub, "device_static_pub")?;
+    let mut client_nonce = [0u8; 32];
+    recv_exact(stream, &mut client_nonce, recv)?;
 
     let mut is_new = false;
     {
@@ -490,19 +593,42 @@ fn handle_setup(
 
     let a = recv_point(stream, recv)?;
     let s = recv_scalar(stream, recv)?;
+    let mut bootstrap_mac = [0u8; 32];
+    recv_exact(stream, &mut bootstrap_mac, recv)?;
 
     let ok = schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s);
     if !ok {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "setup PoP invalid"));
     }
 
+    let expected_bootstrap_mac = compute_bootstrap_mac(
+        &bootstrap_secret,
+        &bootstrap_id,
+        &device_id,
+        &device_static_pub,
+        server_static_pub,
+        &client_nonce,
+        &server_nonce,
+    );
+    if expected_bootstrap_mac != bootstrap_mac {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bootstrap MAC invalid"));
+    }
+
     if is_new {
         let mut reg_w = reg.write().unwrap();
         reg_w.insert(device_id, device_static_pub);
         save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_w)?;
-        println!("Server[SETUP]: enrolled NEW device_id={}", hex::encode(device_id));
+        println!(
+            "Server[SETUP/ZTP]: enrolled NEW device_id={} bootstrap_id={}",
+            hex::encode(device_id),
+            hex::encode(bootstrap_id),
+        );
     } else {
-        println!("Server[SETUP]: validated existing device_id={}", hex::encode(device_id));
+        println!(
+            "Server[SETUP/ZTP]: validated existing device_id={} bootstrap_id={}",
+            hex::encode(device_id),
+            hex::encode(bootstrap_id),
+        );
     }
 
     Ok(())
@@ -661,6 +787,7 @@ fn handle_client(
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
     reg: Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
+    bootstrap_db: Arc<RwLock<HashMap<[u8; 32], BootstrapRecord>>>,
     replay: Arc<Mutex<ReplayCache>>,
 ) {
     let start = Instant::now();
@@ -690,7 +817,7 @@ fn handle_client(
     };
 
     let res = match msg_type {
-        MSG_SETUP => handle_setup(&mut stream, &policy, &server_static_pub, &reg, &mut sent, &mut recv),
+        MSG_SETUP => handle_setup(&mut stream, &policy, &server_static_pub, &reg, &bootstrap_db, &mut sent, &mut recv),
         MSG_AUTH_V2 => handle_auth_v2(&mut stream, &server_static_secret, &server_static_pub, &reg, &replay, &mut sent, &mut recv),
         _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown msg_type")),
     };
@@ -712,6 +839,7 @@ fn main() -> std::io::Result<()> {
     let mut pairing = false;
     let mut pairing_token: Option<String> = None;
     let mut pairing_seconds: Option<u64> = None;
+    let mut add_bootstrap: Option<([u8; 32], [u8; 32])> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -735,6 +863,20 @@ fn main() -> std::io::Result<()> {
                 pairing_seconds = Some(args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad sec"))?);
                 i += 2;
             }
+            "--add-bootstrap" => {
+                if i + 2 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--add-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>")); }
+                let id_dec = hex::decode(&args[i + 1]).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex"))?;
+                let sec_dec = hex::decode(&args[i + 2]).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex"))?;
+                if id_dec.len() != BOOTSTRAP_ID_LEN || sec_dec.len() != BOOTSTRAP_SECRET_LEN {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bootstrap values must both be 32 bytes"));
+                }
+                let mut id = [0u8; 32];
+                let mut sec = [0u8; 32];
+                id.copy_from_slice(&id_dec);
+                sec.copy_from_slice(&sec_dec);
+                add_bootstrap = Some((id, sec));
+                i += 3;
+            }
             _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown argument")),
         }
     }
@@ -742,11 +884,20 @@ fn main() -> std::io::Result<()> {
     let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
 
+    let mut bootstrap_map = load_bootstrap_db(BOOTSTRAP_DB_FILE).unwrap_or_default();
+    if let Some((id, secret)) = add_bootstrap {
+        bootstrap_map.insert(id, BootstrapRecord { secret });
+        save_bootstrap_db_atomic(BOOTSTRAP_DB_FILE, BOOTSTRAP_DB_BAK, &bootstrap_map)?;
+        println!("Server: added bootstrap_id={} to {}", hex::encode(id), BOOTSTRAP_DB_FILE);
+        return Ok(());
+    }
+
     println!("Server: Listening on {}", bind_addr);
-    println!("Server: pairing_enabled={} token_required={} deadline={:?}", policy.enabled, policy.token.is_some(), policy.deadline);
+    println!("Server: pairing_enabled={} token_configured={} deadline={:?} bootstrap_db_entries={}", policy.enabled, policy.token.is_some(), policy.deadline, bootstrap_map.len());
 
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
     let reg = Arc::new(RwLock::new(reg_map));
+    let bootstrap_db = Arc::new(RwLock::new(bootstrap_map));
     let replay = Arc::new(Mutex::new(ReplayCache::default()));
     let listener = TcpListener::bind(&bind_addr)?;
 
@@ -763,10 +914,11 @@ fn main() -> std::io::Result<()> {
         let sp2 = Arc::clone(&sp);
         let pol2 = policy.clone();
         let reg2 = Arc::clone(&reg);
+        let bootstrap2 = Arc::clone(&bootstrap_db);
         let rep2 = Arc::clone(&replay);
 
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, rep2);
+            handle_client(stream, ss2, sp2, pol2, reg2, bootstrap2, rep2);
         });
     }
 }

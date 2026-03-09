@@ -53,6 +53,10 @@ const MSG_AUTH_V2: u8 = 0x03; // Bumped to 0x03 for encrypted tunnel
 
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/device_root.bin";
 const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/server_pub.bin";
+const BOOTSTRAP_ID_FILE: &str = "/var/lib/iot-auth/bootstrap_id.bin";
+const BOOTSTRAP_SECRET_FILE: &str = "/var/lib/iot-auth/bootstrap_secret.bin";
+const BOOTSTRAP_ID_LEN: usize = 32;
+const BOOTSTRAP_SECRET_LEN: usize = 32;
 
 // Transcript domains (versioned; must match server and C if you interop)
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
@@ -359,6 +363,86 @@ fn creds_exist() -> bool {
     Path::new(DEVICE_ROOT_FILE).exists()
 }
 
+
+fn load_exact_file<const N: usize>(path: &str, what: &str) -> std::io::Result<[u8; N]> {
+    let b = fs::read(path)?;
+    if b.len() != N {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} wrong length"),
+        ));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
+fn load_bootstrap_id() -> std::io::Result<[u8; BOOTSTRAP_ID_LEN]> {
+    load_exact_file(BOOTSTRAP_ID_FILE, "bootstrap_id.bin")
+}
+
+fn load_bootstrap_secret() -> std::io::Result<[u8; BOOTSTRAP_SECRET_LEN]> {
+    load_exact_file(BOOTSTRAP_SECRET_FILE, "bootstrap_secret.bin")
+}
+
+fn ztp_mac_transcript(
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let mut t = CompatTranscript::new(b"ztp-bootstrap-v1");
+    t.append_message(b"bootstrap_id", bootstrap_id);
+    t.append_message(b"device_id", device_id);
+    t.append_message(b"device_pub", device_static_pub.compress().as_bytes());
+    t.append_message(b"server_pub", server_static_pub.compress().as_bytes());
+    t.append_message(b"client_nonce", client_nonce);
+    t.append_message(b"server_nonce", server_nonce);
+
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, &t.buf);
+    let out = h.finalize();
+    let mut th = [0u8; 32];
+    th.copy_from_slice(&out);
+    th
+}
+
+fn compute_bootstrap_mac(
+    bootstrap_secret: &[u8; BOOTSTRAP_SECRET_LEN],
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let th = ztp_mac_transcript(
+        bootstrap_id,
+        device_id,
+        device_static_pub,
+        server_static_pub,
+        client_nonce,
+        server_nonce,
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(bootstrap_secret).expect("HMAC key size ok");
+    mac.update(b"ztp-bootstrap-mac");
+    mac.update(&th);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&out);
+    tag
+}
+
+fn save_bootstrap_material(id: &[u8; BOOTSTRAP_ID_LEN], secret: &[u8; BOOTSTRAP_SECRET_LEN]) -> std::io::Result<()> {
+    ensure_parent_dir(BOOTSTRAP_ID_FILE)?;
+    ensure_parent_dir(BOOTSTRAP_SECRET_FILE)?;
+    fs::write(BOOTSTRAP_ID_FILE, id)?;
+    fs::write(BOOTSTRAP_SECRET_FILE, secret)?;
+    Ok(())
+}
+
 // ----------------------------------------------------
 // Server pubkey pinning (TOFU & Out-of-band)
 // ----------------------------------------------------
@@ -381,6 +465,7 @@ fn load_server_pub() -> std::io::Result<Option<RistrettoPoint>> {
 }
 
 fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
+    ensure_parent_dir(SERVER_PUB_FILE)?;
     fs::write(SERVER_PUB_FILE, pubkey.compress().as_bytes())?;
     Ok(())
 }
@@ -392,52 +477,65 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
     let mut sent = 0usize;
     let mut recv = 0usize;
 
+    let bootstrap_id = load_bootstrap_id()?;
+    let bootstrap_secret = load_bootstrap_secret()?;
+    let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ZTP setup requires a pinned server_pub.bin; use --pin-server-pub first",
+        )
+    })?;
+
     let mut stream = TcpStream::connect(server_addr)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
-    println!("Client[SETUP]: Connected to {}", server_addr);
+    println!("Client[SETUP/ZTP]: Connected to {}", server_addr);
 
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
-    send_all(&mut stream, &[0u8], &mut sent)?;
+    send_all(&mut stream, &[BOOTSTRAP_ID_LEN as u8], &mut sent)?;
+    send_all(&mut stream, &bootstrap_id, &mut sent)?;
 
     let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
     reject_identity(&device_static_pub, "client device_static_pub")?;
 
+    let client_nonce = random_bytes_32();
     send_all(&mut stream, &device_id, &mut sent)?;
     send_all(&mut stream, device_static_pub.compress().as_bytes(), &mut sent)?;
+    send_all(&mut stream, &client_nonce, &mut sent)?;
     stream.flush()?;
 
     let server_static_pub = recv_point(&mut stream, &mut recv)?;
     reject_identity(&server_static_pub, "server_static_pub")?;
+    if pinned_server_pub.compress().to_bytes() != server_static_pub.compress().to_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "MITM ALERT: Server offered a different public key than our pinned key!",
+        ));
+    }
+    println!("Client[SETUP/ZTP]: Server pubkey matches pinned value.");
 
     let mut server_nonce = [0u8; 32];
     recv_exact(&mut stream, &mut server_nonce, &mut recv)?;
 
-    // MITM Protection: Enforce out-of-band pin if it exists, otherwise TOFU
-    match load_server_pub()? {
-        None => {
-            println!("Client[SETUP]: Pinning server pubkey (TOFU) to {}", SERVER_PUB_FILE);
-            save_server_pub(&server_static_pub)?;
-        }
-        Some(pinned) => {
-            if pinned.compress().to_bytes() != server_static_pub.compress().to_bytes() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "MITM ALERT: Server offered a different public key than our pinned key!",
-                ));
-            }
-            println!("Client[SETUP]: Server pubkey matches pinned value.");
-        }
-    }
-
     let (a, s) = schnorr_prove_setup(&x, &device_id, &server_nonce);
+    let bootstrap_mac = compute_bootstrap_mac(
+        &bootstrap_secret,
+        &bootstrap_id,
+        &device_id,
+        &device_static_pub,
+        &server_static_pub,
+        &client_nonce,
+        &server_nonce,
+    );
+
     send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
     send_all(&mut stream, &s.to_bytes(), &mut sent)?;
+    send_all(&mut stream, &bootstrap_mac, &mut sent)?;
     stream.flush()?;
 
-    println!("Client[SETUP]: Sent={} bytes, Received={} bytes. Enrolled.", sent, recv);
+    println!("Client[SETUP/ZTP]: Sent={} bytes, Received={} bytes. Enrolled.", sent, recv);
     x.zeroize();
     Ok(())
 }
@@ -610,6 +708,25 @@ fn main() -> std::io::Result<()> {
                 do_setup_flag = true;
                 i += 1;
             }
+            "--provision-bootstrap" => {
+                if i + 2 >= args.len() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--provision-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>"));
+                }
+                let id_hex = args[i + 1].clone();
+                let secret_hex = args[i + 2].clone();
+                let id_dec = hex::decode(&id_hex).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex"))?;
+                let sec_dec = hex::decode(&secret_hex).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex"))?;
+                if id_dec.len() != BOOTSTRAP_ID_LEN || sec_dec.len() != BOOTSTRAP_SECRET_LEN {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bootstrap values must both be 32 bytes"));
+                }
+                let mut id = [0u8; BOOTSTRAP_ID_LEN];
+                let mut sec = [0u8; BOOTSTRAP_SECRET_LEN];
+                id.copy_from_slice(&id_dec);
+                sec.copy_from_slice(&sec_dec);
+                save_bootstrap_material(&id, &sec)?;
+                println!("Client: saved bootstrap_id and bootstrap_secret.");
+                i += 3;
+            }
             "--pin-server-pub" => {
                 if i + 1 >= args.len() {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pin-server-pub missing value"));
@@ -644,9 +761,9 @@ fn main() -> std::io::Result<()> {
 
     if do_setup_flag {
         if creds_exist() {
-            println!("Client[SETUP]: Using existing device root for setup (idempotent).");
+            println!("Client[SETUP/ZTP]: Using existing device root for setup.");
         } else {
-            println!("Client[SETUP]: No device root found; generating NEW device root (re-enroll).");
+            println!("Client[SETUP/ZTP]: No device root found; generating NEW device root.");
         }
         let (device_id, x) = load_device_creds_from_root()?;
         do_setup(&server_addr, device_id, x)?;
