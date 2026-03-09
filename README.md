@@ -1,97 +1,296 @@
+
+---
+
 # ZK-ARCHE (Rust Implementation)
 
-Lightweight Schnorr Zero-Knowledge Mutual Authentication over
-Ristretto255.
+Lightweight **Zero-Knowledge Proof Mutual Authentication** using Schnorr proofs over **Ristretto255**.
 
-------------------------------------------------------------------------
+This Rust implementation is the **reference implementation** of the ZK-ARCHE protocol and interoperates with the C version used for embedded and IoT environments.
 
-## Overview
+The system supports:
 
-Rust implementation of ZK-ARCHE, a lightweight elliptic-curve-based
-mutual authentication protocol for IoT and edge systems.
+* **Zero-Touch Provisioning (ZTP)**
+* **Schnorr Zero-Knowledge Authentication**
+* **Secure encrypted communication channel**
 
-### Cryptographic Design
+---
 
--   Group: Ristretto255 (prime-order abstraction over Curve25519)
--   Proof System: Schnorr ZKP (Fiat--Shamir)
--   Transcript: Deterministic C-compatible transcript
--   Hash: SHA-512 (challenge derivation)
--   KDF: HKDF-SHA256
--   Transport: TCP over LAN
+# Architecture
 
-------------------------------------------------------------------------
+| Component              | Role                       |
+| ---------------------- | -------------------------- |
+| Raspberry Pi 3 / 4 / 5 | Provers (IoT devices)      |
+| Ubuntu Server          | Verifier                   |
+| Bootstrap Registry     | Provisioning database      |
+| Device Root Secret     | Persistent device identity |
 
-## 1. Install Dependencies (Ubuntu / Raspberry Pi OS)
+---
 
-``` bash
+# Cryptographic Design
+
+| Primitive        | Algorithm         |
+| ---------------- | ----------------- |
+| Group            | Ristretto255      |
+| Proof System     | Schnorr ZKP       |
+| Fiat-Shamir Hash | SHA-512           |
+| Key Derivation   | HKDF-SHA256       |
+| Encryption       | ChaCha20-Poly1305 |
+| Transport        | TCP               |
+
+Libraries used:
+
+* `curve25519-dalek`
+* `sha2`
+* `hkdf`
+* `chacha20poly1305`
+* `rand`
+
+---
+
+# Security Model
+
+The protocol separates **two identities**.
+
+---
+
+## 1️⃣ Bootstrap Identity (Provisioning)
+
+Used **only during device onboarding**.
+
+Device proves knowledge of:
+
+```
+bootstrap_secret
+```
+
+Server verifies against:
+
+```
+bootstrap_registry.bin
+```
+
+This enables **Zero-Touch Provisioning**.
+
+---
+
+## 2️⃣ Operational Identity (Authentication)
+
+Derived from the device root secret:
+
+```
+device_root.bin
+```
+
+Client derives:
+
+```
+device_id
+device_private_scalar x
+device_public_key = G * x
+```
+
+Authentication uses a **Schnorr Zero-Knowledge Proof**.
+
+---
+
+# File Layout
+
+## Client (IoT Device)
+
+```
+/var/lib/iot-auth/
+
+device_root.bin
+bootstrap_id.bin
+bootstrap_secret.bin
+server_pub.bin
+```
+
+| File                 | Purpose                    |
+| -------------------- | -------------------------- |
+| device_root.bin      | device root secret         |
+| bootstrap_id.bin     | bootstrap identifier       |
+| bootstrap_secret.bin | bootstrap credential       |
+| server_pub.bin       | pinned verifier public key |
+
+---
+
+## Server (Verifier)
+
+```
+registry.bin
+bootstrap_registry.bin
+server_sk.bin
+```
+
+| File                   | Purpose                    |
+| ---------------------- | -------------------------- |
+| registry.bin           | enrolled device identities |
+| bootstrap_registry.bin | bootstrap credentials      |
+| server_sk.bin          | verifier private key       |
+
+---
+
+# Install Dependencies
+
+Ubuntu / Raspberry Pi OS
+
+```bash
 sudo apt update
 sudo apt install build-essential pkg-config git curl
 ```
 
 Install Rust:
 
-``` bash
+```bash
 curl https://sh.rustup.rs -sSf | sh
 source ~/.cargo/env
 rustup update
 ```
 
-------------------------------------------------------------------------
+---
 
-## 2. Compile (Release Build)
+# Compile (Release Build)
 
-``` bash
+```bash
 cargo build --release
 ```
 
-Compiled binaries:
+Binaries:
 
-``` bash
+```
 ./target/release/client
 ./target/release/server
 ```
 
-You may also compile and run in one step:
+You can also build individually:
 
-``` bash
+```bash
 cargo build --release --bin server
 cargo build --release --bin client
 ```
 
-------------------------------------------------------------------------
+---
 
-## 3. Run Server
+# Server Setup
 
-``` bash
+## 1️⃣ Add Bootstrap Credentials
+
+Each device requires a unique bootstrap credential.
+
+Generate credentials:
+
+```bash
+BOOTSTRAP_ID=$(openssl rand -hex 16)
+BOOTSTRAP_SECRET=$(openssl rand -hex 32)
+```
+
+Add them to the bootstrap registry:
+
+```bash
+./target/release/server --add-bootstrap $BOOTSTRAP_ID $BOOTSTRAP_SECRET
+```
+
+---
+
+## 2️⃣ Start the Verifier
+
+Enable provisioning window:
+
+```bash
 ./target/release/server --bind 0.0.0.0:4000 --pairing
 ```
 
-------------------------------------------------------------------------
+Without `--pairing`, device setup is rejected.
 
-## 4. Provision Device (SETUP)
+---
 
-``` bash
-./target/release/client --server 127.0.0.1:4000 --setup
+# Device Provisioning (ZTP)
+
+Before provisioning, install bootstrap credentials on the device.
+
+```bash
+./target/release/client --provision-bootstrap <bootstrap_id_hex> <bootstrap_secret_hex>
 ```
 
-------------------------------------------------------------------------
+Pin the server public key:
 
-## 5. Authenticate (AUTH)
-
-``` bash
-./target/release/client --server 127.0.0.1:4000
+```bash
+./target/release/client --pin-server-pub <server_pub_hex>
 ```
 
-------------------------------------------------------------------------
+Run provisioning:
 
-## 6. Reset Environment
-
-``` bash
-rm -f device_id.bin device_x.bin registry.bin registry.bak
+```bash
+./target/release/client --server <server_ip>:4000 --setup
 ```
 
-------------------------------------------------------------------------
+The device will now be enrolled in `registry.bin`.
 
-## Research Notice
+---
 
-Research prototype. Not production hardened.
+# Authentication
+
+After provisioning, devices authenticate normally.
+
+```bash
+./target/release/client --server <server_ip>:4000
+```
+
+Authentication uses:
+
+```
+Schnorr Zero-Knowledge Proof
+```
+
+over an encrypted transport channel.
+
+---
+
+# Example Deployment
+
+Verifier:
+
+```
+Ubuntu Server
+192.168.1.10
+```
+
+Provers:
+
+```
+Raspberry Pi 3 → 192.168.1.101
+Raspberry Pi 4 → 192.168.1.102
+Raspberry Pi 5 → 192.168.1.103
+```
+
+Provision each device once, then authenticate repeatedly.
+
+---
+
+# Reset Environment
+
+Client reset:
+
+```bash
+sudo rm -rf /var/lib/iot-auth
+```
+
+Server reset:
+
+```bash
+rm -f registry.bin bootstrap_registry.bin server_sk.bin
+```
+
+---
+
+# Research Notice
+
+This project is a **research prototype** for:
+
+* IoT authentication protocols
+* Zero-knowledge identification systems
+* cross-language cryptographic interoperability
+* evaluation on constrained devices
+
+Not intended for production deployment without additional hardening.
