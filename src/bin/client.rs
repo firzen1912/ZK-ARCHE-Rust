@@ -1,5 +1,5 @@
 // ==============================
-// client.rs (V2: Zero Privacy + TOFU Pinning & Key Confirmation)
+// client.rs (V2: Schnorr Ristretto25519 + X25519 + ChaCha20-Poly1305 + HKDF + HMAC with ZTP bootstrap)
 // ==============================
 //
 // Goals:
@@ -7,18 +7,20 @@
 //   2) Enforce pinned server_static_pub during SETUP and AUTH (reject MITM).
 //   3) Zero Privacy: Hide identity (device_id) during AUTH using X25519 ECDHE tunnel.
 //   4) Add key confirmation MACs: "server finished" and "client finished".
+//   5) ZTP bootstrap: client proves knowledge of the bootstrap secret during SETUP via a MAC.
 //
-// Dependencies (Cargo.toml):
+// Cargo.toml dependencies:
 //   curve25519-dalek = "4"
-//   x25519-dalek = "2.0"
+//   x25519-dalek     = { version = "2.0", features = ["static_secrets"] }
 //   chacha20poly1305 = "0.10"
-//   blake2 = "0.10"
-//   rand = "0.8"
-//   sha2 = "0.10"
-//   hkdf = "0.12"
-//   hmac = "0.12"
-//   hex = "0.4"
-//   zeroize = "1"
+//   blake2           = "0.10"
+//   rand             = "0.8"
+//   sha2             = "0.10"
+//   hkdf             = "0.12"
+//   hmac             = "0.12"
+//   hex              = "0.4"
+//   zeroize          = "1"
+//   subtle           = "2"        ← NEW
 //
 
 use std::env;
@@ -40,16 +42,17 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
+// [FIX-3] Import subtle for constant-time comparisons
+use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const DEVICE_ID_LEN: usize = 32;
 const NONCE_LEN: usize = 32;
 
 const MSG_SETUP: u8 = 0x01;
-const MSG_AUTH_V2: u8 = 0x03; // Bumped to 0x03 for encrypted tunnel
+const MSG_AUTH_V2: u8 = 0x03;
 
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/device_root.bin";
 const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/server_pub.bin";
@@ -58,18 +61,41 @@ const BOOTSTRAP_SECRET_FILE: &str = "/var/lib/iot-auth/bootstrap_secret.bin";
 const BOOTSTRAP_ID_LEN: usize = 32;
 const BOOTSTRAP_SECRET_LEN: usize = 32;
 
-// Transcript domains (versioned; must match server and C if you interop)
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
 const T_CLIENT: &[u8] = b"client_schnorr_v1";
 const T_SERVER: &[u8] = b"server_schnorr_v1";
 const T_KC: &[u8] = b"kc_v1";
 
-// Networking hardening
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-// ----------------------------------------------------
-// C-compatible transcript (replaces merlin::Transcript)
-// ----------------------------------------------------
+// [FIX-4] Hard cap on incoming encrypted payload size
+const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
+
+// ============================================================
+// [FIX-9] NonceCounter — safe sequential nonce management
+// ============================================================
+struct NonceCounter {
+    value: u64,
+}
+
+impl NonceCounter {
+    fn new() -> Self {
+        Self { value: 0 }
+    }
+
+    // Returns a fresh 12-byte nonce and advances the counter.
+    fn next(&mut self) -> Nonce {
+        let n = self.value;
+        self.value = self.value.checked_add(1).expect("nonce counter exhausted");
+        let mut bytes = [0u8; 12];
+        bytes[..8].copy_from_slice(&n.to_le_bytes());
+        *Nonce::from_slice(&bytes)
+    }
+}
+
+// ============================================================
+// C-compatible transcript
+// ============================================================
 struct CompatTranscript {
     buf: Vec<u8>,
 }
@@ -87,7 +113,6 @@ impl CompatTranscript {
         assert!(label.len() <= 255, "label too long");
         self.buf.push(label.len() as u8);
         self.buf.extend_from_slice(label);
-
         let len = msg.len() as u32;
         self.buf.extend_from_slice(&len.to_le_bytes());
         self.buf.extend_from_slice(msg);
@@ -96,16 +121,16 @@ impl CompatTranscript {
     fn challenge_scalar(&self) -> Scalar {
         let mut h = Sha512::new();
         sha2::Digest::update(&mut h, &self.buf);
-        let digest = h.finalize(); // 64 bytes
+        let digest = h.finalize();
         let mut wide = [0u8; 64];
         wide.copy_from_slice(&digest);
         Scalar::from_bytes_mod_order_wide(&wide)
     }
 }
 
-// ----------------------------------------------------
+// ============================================================
 // Crypto helpers
-// ----------------------------------------------------
+// ============================================================
 fn random_scalar() -> Scalar {
     let mut bytes = [0u8; 64];
     OsRng.fill_bytes(&mut bytes);
@@ -118,20 +143,20 @@ fn random_bytes_32() -> [u8; 32] {
     b
 }
 
-/// Reject identity points (hardening).
+// [FIX-7] Reject identity (neutral) points on all adversary inputs
 fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     if *p == RistrettoPoint::default() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{what} is identity"),
+            format!("{what} is the identity point"),
         ));
     }
     Ok(())
 }
 
-// ----------------------------------------------------
+// ============================================================
 // Schnorr proofs
-// ----------------------------------------------------
+// ============================================================
 fn schnorr_prove_setup(
     x: &Scalar,
     device_id: &[u8; 32],
@@ -140,13 +165,11 @@ fn schnorr_prove_setup(
     let pubkey = RISTRETTO_BASEPOINT_POINT * x;
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
-
     let mut t = CompatTranscript::new(T_SETUP);
     t.append_message(b"device_id", device_id);
     t.append_message(b"pubkey", pubkey.compress().as_bytes());
     t.append_message(b"a", a.compress().as_bytes());
     t.append_message(b"server_nonce", server_nonce);
-
     let c = t.challenge_scalar();
     let s = r + c * x;
     (a, s)
@@ -161,14 +184,12 @@ fn schnorr_prove_auth(
     let pubkey = RISTRETTO_BASEPOINT_POINT * x;
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
-
     let mut t = CompatTranscript::new(T_CLIENT);
     t.append_message(b"device_id", device_id);
     t.append_message(b"pubkey", pubkey.compress().as_bytes());
     t.append_message(b"a", a.compress().as_bytes());
     t.append_message(b"nonce_c", nonce_c);
     t.append_message(b"eph_c", eph_c.compress().as_bytes());
-
     let c = t.challenge_scalar();
     let s = r + c * x;
     (a, s)
@@ -186,14 +207,14 @@ fn schnorr_verify_server(
     t.append_message(b"a", a.compress().as_bytes());
     t.append_message(b"nonce_s", nonce_s);
     t.append_message(b"eph_s", eph_s.compress().as_bytes());
-
     let c = t.challenge_scalar();
     RISTRETTO_BASEPOINT_POINT * s == a + server_static_pub * c
 }
 
-// ----------------------------------------------------
+// ============================================================
 // Session key derivation
-// ----------------------------------------------------
+// [FIX-8] x25519_shared is mixed in so the outer tunnel binds to the session key
+// ============================================================
 fn derive_session_key(
     eph_secret: &Scalar,
     peer_eph_pub: &RistrettoPoint,
@@ -202,6 +223,7 @@ fn derive_session_key(
     device_id: &[u8; 32],
     eph_c: &RistrettoPoint,
     eph_s: &RistrettoPoint,
+    x25519_shared: &[u8; 32], // [FIX-8] channel binding
 ) -> [u8; 32] {
     let shared = peer_eph_pub * eph_secret;
     let shared_bytes = shared.compress().to_bytes();
@@ -210,11 +232,12 @@ fn derive_session_key(
     salt[..32].copy_from_slice(nonce_c);
     salt[32..].copy_from_slice(nonce_s);
 
-    let mut info = Vec::with_capacity(11 + 32 + 32 + 32);
-    info.extend_from_slice(b"session key"); // 11 bytes
+    let mut info = Vec::with_capacity(11 + 32 + 32 + 32 + 32);
+    info.extend_from_slice(b"session key");
     info.extend_from_slice(device_id);
     info.extend_from_slice(eph_c.compress().as_bytes());
     info.extend_from_slice(eph_s.compress().as_bytes());
+    info.extend_from_slice(x25519_shared); // [FIX-8]
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &shared_bytes);
     let mut okm = [0u8; 32];
@@ -222,9 +245,9 @@ fn derive_session_key(
     okm
 }
 
-// ----------------------------------------------------
-// Key confirmation (KC): transcript hash + HMACs
-// ----------------------------------------------------
+// ============================================================
+// Key confirmation (KC)
+// ============================================================
 fn kc_transcript_hash(
     device_id: &[u8; 32],
     a_c: &RistrettoPoint,
@@ -267,7 +290,6 @@ fn derive_kc_keys(session_key: &[u8; 32], th: &[u8; 32]) -> ([u8; 32], [u8; 32])
 }
 
 fn hmac_tag(key: &[u8; 32], label: &[u8], th: &[u8; 32]) -> [u8; 32] {
-    // Explicitly cast to the Mac trait to resolve the naming collision
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key size ok");
     mac.update(label);
     mac.update(th);
@@ -277,9 +299,9 @@ fn hmac_tag(key: &[u8; 32], label: &[u8], th: &[u8; 32]) -> [u8; 32] {
     tag
 }
 
-// ----------------------------------------------------
-// Network helpers WITH BYTE COUNTING
-// ----------------------------------------------------
+// ============================================================
+// Network helpers
+// ============================================================
 fn send_all(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
     *sent += buf.len();
     stream.write_all(buf)
@@ -291,17 +313,28 @@ fn recv_exact(stream: &mut impl Read, buf: &mut [u8], recv: &mut usize) -> std::
     Ok(())
 }
 
-fn recv_point(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<RistrettoPoint> {
-    let mut b = [0u8; 32];
-    recv_exact(stream, &mut b, recv)?;
-    CompressedRistretto(b)
-        .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid point"))
+// [FIX-4] Bounded length-prefixed ciphertext read (shared by both send paths)
+fn recv_encrypted_blob(
+    stream: &mut impl Read,
+    recv: &mut usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    recv_exact(stream, &mut len_buf, recv)?;
+    let rx_len = u32::from_le_bytes(len_buf) as usize;
+    if rx_len > MAX_ENCRYPTED_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("payload too large: {rx_len} bytes (max {MAX_ENCRYPTED_PAYLOAD})"),
+        ));
+    }
+    let mut buf = vec![0u8; rx_len];
+    recv_exact(stream, &mut buf, recv)?;
+    Ok(buf)
 }
 
-// ----------------------------------------------------
-// Local credential storage (root-secret model)
-// ----------------------------------------------------
+// ============================================================
+// Local credential storage
+// ============================================================
 fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         fs::create_dir_all(parent)?;
@@ -334,7 +367,6 @@ fn derive_device_id(root: &[u8; 32]) -> [u8; 32] {
     sha2::Digest::update(&mut h, b"device-id");
     sha2::Digest::update(&mut h, root);
     let out = h.finalize();
-
     let mut device_id = [0u8; 32];
     device_id.copy_from_slice(&out);
     device_id
@@ -345,7 +377,6 @@ fn derive_device_scalar(root: &[u8; 32]) -> Scalar {
     sha2::Digest::update(&mut h, b"device-auth-v1");
     sha2::Digest::update(&mut h, root);
     let digest = h.finalize();
-
     let mut wide = [0u8; 64];
     wide.copy_from_slice(&digest);
     Scalar::from_bytes_mod_order_wide(&wide)
@@ -362,7 +393,6 @@ fn load_device_creds_from_root() -> std::io::Result<([u8; 32], Scalar)> {
 fn creds_exist() -> bool {
     Path::new(DEVICE_ROOT_FILE).exists()
 }
-
 
 fn load_exact_file<const N: usize>(path: &str, what: &str) -> std::io::Result<[u8; N]> {
     let b = fs::read(path)?;
@@ -400,7 +430,6 @@ fn ztp_mac_transcript(
     t.append_message(b"server_pub", server_static_pub.compress().as_bytes());
     t.append_message(b"client_nonce", client_nonce);
     t.append_message(b"server_nonce", server_nonce);
-
     let mut h = Sha256::new();
     sha2::Digest::update(&mut h, &t.buf);
     let out = h.finalize();
@@ -419,12 +448,8 @@ fn compute_bootstrap_mac(
     server_nonce: &[u8; 32],
 ) -> [u8; 32] {
     let th = ztp_mac_transcript(
-        bootstrap_id,
-        device_id,
-        device_static_pub,
-        server_static_pub,
-        client_nonce,
-        server_nonce,
+        bootstrap_id, device_id, device_static_pub,
+        server_static_pub, client_nonce, server_nonce,
     );
     let mut mac = <HmacSha256 as Mac>::new_from_slice(bootstrap_secret).expect("HMAC key size ok");
     mac.update(b"ztp-bootstrap-mac");
@@ -435,7 +460,10 @@ fn compute_bootstrap_mac(
     tag
 }
 
-fn save_bootstrap_material(id: &[u8; BOOTSTRAP_ID_LEN], secret: &[u8; BOOTSTRAP_SECRET_LEN]) -> std::io::Result<()> {
+fn save_bootstrap_material(
+    id: &[u8; BOOTSTRAP_ID_LEN],
+    secret: &[u8; BOOTSTRAP_SECRET_LEN],
+) -> std::io::Result<()> {
     ensure_parent_dir(BOOTSTRAP_ID_FILE)?;
     ensure_parent_dir(BOOTSTRAP_SECRET_FILE)?;
     fs::write(BOOTSTRAP_ID_FILE, id)?;
@@ -443,23 +471,27 @@ fn save_bootstrap_material(id: &[u8; BOOTSTRAP_ID_LEN], secret: &[u8; BOOTSTRAP_
     Ok(())
 }
 
-// ----------------------------------------------------
-// Server pubkey pinning (TOFU & Out-of-band)
-// ----------------------------------------------------
+// ============================================================
+// Server pubkey pinning (TOFU & out-of-band)
+// ============================================================
 fn load_server_pub() -> std::io::Result<Option<RistrettoPoint>> {
     if !Path::new(SERVER_PUB_FILE).exists() {
         return Ok(None);
     }
     let b = fs::read(SERVER_PUB_FILE)?;
     if b.len() != 32 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "server_pub.bin wrong length"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server_pub.bin wrong length",
+        ));
     }
     let mut bb = [0u8; 32];
     bb.copy_from_slice(&b);
-
     let p = CompressedRistretto(bb)
         .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server_pub invalid"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "server_pub invalid")
+        })?;
     reject_identity(&p, "pinned server_pub")?;
     Ok(Some(p))
 }
@@ -470,10 +502,16 @@ fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
     Ok(())
 }
 
-// ----------------------------------------------------
-// SETUP (provisioning handshake)
-// ----------------------------------------------------
-fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
+// ============================================================
+// SETUP (ZTP provisioning handshake)
+// [FIX-1] Now sends the pairing token to the server
+// ============================================================
+fn do_setup(
+    server_addr: &str,
+    device_id: [u8; 32],
+    mut x: Scalar,
+    pairing_token: Option<&str>, // [FIX-1]
+) -> std::io::Result<()> {
     let mut sent = 0usize;
     let mut recv = 0usize;
 
@@ -494,6 +532,25 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
     println!("Client[SETUP/ZTP]: Connected to {}", server_addr);
 
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
+
+    // [FIX-1] Send pairing token length-prefixed (0 = no token)
+    match pairing_token {
+        Some(token) => {
+            let tb = token.as_bytes();
+            if tb.len() > 128 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "pairing token too long (max 128 bytes)",
+                ));
+            }
+            send_all(&mut stream, &[tb.len() as u8], &mut sent)?;
+            send_all(&mut stream, tb, &mut sent)?;
+        }
+        None => {
+            send_all(&mut stream, &[0u8], &mut sent)?; // 0 = no token
+        }
+    }
+
     send_all(&mut stream, &[BOOTSTRAP_ID_LEN as u8], &mut sent)?;
     send_all(&mut stream, &bootstrap_id, &mut sent)?;
 
@@ -506,12 +563,28 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
     send_all(&mut stream, &client_nonce, &mut sent)?;
     stream.flush()?;
 
-    let server_static_pub = recv_point(&mut stream, &mut recv)?;
+    // Receive server static public key
+    let mut s_pub_bytes = [0u8; 32];
+    recv_exact(&mut stream, &mut s_pub_bytes, &mut recv)?;
+    // [FIX-2] No unwrap; [FIX-7] identity check
+    let server_static_pub = CompressedRistretto(s_pub_bytes)
+        .decompress()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid server_static_pub")
+        })?;
     reject_identity(&server_static_pub, "server_static_pub")?;
-    if pinned_server_pub.compress().to_bytes() != server_static_pub.compress().to_bytes() {
+
+    // [FIX-3] Constant-time pinned key comparison
+    if pinned_server_pub
+        .compress()
+        .to_bytes()
+        .ct_eq(&server_static_pub.compress().to_bytes())
+        .unwrap_u8()
+        == 0
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
-            "MITM ALERT: Server offered a different public key than our pinned key!",
+            "MITM ALERT: server offered a different public key than our pinned key!",
         ));
     }
     println!("Client[SETUP/ZTP]: Server pubkey matches pinned value.");
@@ -521,13 +594,9 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
 
     let (a, s) = schnorr_prove_setup(&x, &device_id, &server_nonce);
     let bootstrap_mac = compute_bootstrap_mac(
-        &bootstrap_secret,
-        &bootstrap_id,
-        &device_id,
-        &device_static_pub,
-        &server_static_pub,
-        &client_nonce,
-        &server_nonce,
+        &bootstrap_secret, &bootstrap_id, &device_id,
+        &device_static_pub, &server_static_pub,
+        &client_nonce, &server_nonce,
     );
 
     send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
@@ -535,21 +604,27 @@ fn do_setup(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::R
     send_all(&mut stream, &bootstrap_mac, &mut sent)?;
     stream.flush()?;
 
-    println!("Client[SETUP/ZTP]: Sent={} bytes, Received={} bytes. Enrolled.", sent, recv);
+    println!(
+        "Client[SETUP/ZTP]: Sent={} bytes, Received={} bytes. Enrolled.",
+        sent, recv,
+    );
     x.zeroize();
     Ok(())
 }
 
-// ----------------------------------------------------
-// AUTH V2 (Encrypted Zero-Privacy Tunnel)
-// ----------------------------------------------------
+// ============================================================
+// AUTH V2 (encrypted zero-privacy tunnel)
+// ============================================================
 fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv = 0usize;
 
     let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "No pinned server_pub.bin")
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "No pinned server_pub.bin",
+        )
     })?;
 
     let mut stream = TcpStream::connect(server_addr)?;
@@ -559,7 +634,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 
     println!("Client[AUTH]: Connected to {}", server_addr);
 
-    // 1. ANONYMOUS EPHEMERAL KEY EXCHANGE (ECDHE)
+    // ── 1. Anonymous ephemeral X25519 key exchange ────────────────────────────
     let client_sk = EphemeralSecret::random_from_rng(OsRng);
     let client_pk = X25519Public::from(&client_sk);
 
@@ -571,8 +646,11 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     recv_exact(&mut stream, &mut server_pk_bytes, &mut recv)?;
     let server_pk = X25519Public::from(server_pk_bytes);
 
-    // Derive Session Keys (Matching libsodium's crypto_kx exactly)
+    // Derive tunnel keys (libsodium crypto_kx order)
     let shared_secret = client_sk.diffie_hellman(&server_pk);
+    // [FIX-8] Retain raw shared secret bytes to bind into session key
+    let x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
+
     let mut hasher = Blake2b512::new();
     hasher.update(shared_secret.as_bytes());
     hasher.update(client_pk.as_bytes());
@@ -581,13 +659,17 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 
     let mut rx_key = [0u8; 32];
     let mut tx_key = [0u8; 32];
-    rx_key.copy_from_slice(&hash[0..32]);  // S->C
-    tx_key.copy_from_slice(&hash[32..64]); // C->S
+    rx_key.copy_from_slice(&hash[0..32]);  // S→C (client RX)
+    tx_key.copy_from_slice(&hash[32..64]); // C→S (client TX)
 
     let cipher_tx = ChaCha20Poly1305::new(&tx_key.into());
     let cipher_rx = ChaCha20Poly1305::new(&rx_key.into());
 
-    // 2. ENCRYPT IDENTITY AND SCHNORR PROOF
+    // [FIX-9] Separate nonce counters per direction
+    let mut nonce_tx_ctr = NonceCounter::new();
+    let mut nonce_rx_ctr = NonceCounter::new();
+
+    // ── 2. Encrypt and send identity + Schnorr proof ──────────────────────────
     let mut nonce_c = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_c);
 
@@ -602,8 +684,9 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     payload1.extend_from_slice(&nonce_c);
     payload1.extend_from_slice(eph_pub.compress().as_bytes());
 
-    let nonce_tx_1 = Nonce::from_slice(&[0u8; 12]); // Safe for 1st msg
-    let ct1 = cipher_tx.encrypt(nonce_tx_1, payload1.as_ref())
+    // [FIX-2] Proper error propagation; [FIX-9] NonceCounter manages nonce
+    let ct1 = cipher_tx
+        .encrypt(&nonce_tx_ctr.next(), payload1.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encryption failed"))?;
 
     let len1 = (ct1.len() as u32).to_le_bytes();
@@ -611,67 +694,114 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     send_all(&mut stream, &ct1, &mut sent)?;
     stream.flush()?;
 
-    // 3. READ ENCRYPTED SERVER RESPONSE
-    let mut len_buf = [0u8; 4];
-    recv_exact(&mut stream, &mut len_buf, &mut recv)?;
-    let rx_len = u32::from_le_bytes(len_buf) as usize;
+    // ── 3. Read and decrypt server response ───────────────────────────────────
+    // [FIX-4] Bounded allocation
+    let rx_ct = recv_encrypted_blob(&mut stream, &mut recv)?;
 
-    let mut rx_ct = vec![0u8; rx_len];
-    recv_exact(&mut stream, &mut rx_ct, &mut recv)?;
-
-    let nonce_rx = Nonce::from_slice(&[0u8; 12]); // Safe on RX key
-    let pt2 = cipher_rx.decrypt(nonce_rx, rx_ct.as_ref())
+    // [FIX-9] NonceCounter advances automatically
+    let pt2 = cipher_rx
+        .decrypt(&nonce_rx_ctr.next(), rx_ct.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed"))?;
 
     if pt2.len() != 192 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid server payload"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid server payload length: {} (expected 192)", pt2.len()),
+        ));
     }
 
-    let mut s_pub_bytes = [0u8; 32]; s_pub_bytes.copy_from_slice(&pt2[0..32]);
-    let mut a_s_bytes = [0u8; 32]; a_s_bytes.copy_from_slice(&pt2[32..64]);
-    let mut s_s_bytes = [0u8; 32]; s_s_bytes.copy_from_slice(&pt2[64..96]);
-    let mut nonce_s = [0u8; 32]; nonce_s.copy_from_slice(&pt2[96..128]);
-    let mut eph_s_bytes = [0u8; 32]; eph_s_bytes.copy_from_slice(&pt2[128..160]);
-    let mut tag_s = [0u8; 32]; tag_s.copy_from_slice(&pt2[160..192]);
+    let mut s_pub_bytes  = [0u8; 32]; s_pub_bytes.copy_from_slice(&pt2[0..32]);
+    let mut a_s_bytes    = [0u8; 32]; a_s_bytes.copy_from_slice(&pt2[32..64]);
+    let mut s_s_bytes    = [0u8; 32]; s_s_bytes.copy_from_slice(&pt2[64..96]);
+    let mut nonce_s      = [0u8; 32]; nonce_s.copy_from_slice(&pt2[96..128]);
+    let mut eph_s_bytes  = [0u8; 32]; eph_s_bytes.copy_from_slice(&pt2[128..160]);
+    let mut tag_s        = [0u8; 32]; tag_s.copy_from_slice(&pt2[160..192]);
 
-    let server_static_pub = CompressedRistretto(s_pub_bytes).decompress().unwrap();
-    let a_s = CompressedRistretto(a_s_bytes).decompress().unwrap();
-    let s_s = Scalar::from_canonical_bytes(s_s_bytes).unwrap();
-    let eph_s = CompressedRistretto(eph_s_bytes).decompress().unwrap();
+    // [FIX-2] No unwrap on adversary data; [FIX-7] reject_identity on all points
+    let server_static_pub = CompressedRistretto(s_pub_bytes)
+        .decompress()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid server_static_pub")
+        })?;
+    reject_identity(&server_static_pub, "server_static_pub")?;
 
-    // Verify pinned server identity
-    if server_static_pub.compress().to_bytes() != pinned_server_pub.compress().to_bytes() {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server pubkey mismatch"));
+    let a_s = CompressedRistretto(a_s_bytes)
+        .decompress()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid a_s")
+        })?;
+    reject_identity(&a_s, "a_s")?;
+
+    // [FIX-10] dalek v4: Option::from(CtOption)
+    let s_s = Option::from(Scalar::from_canonical_bytes(s_s_bytes))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical s_s")
+        })?;
+
+    let eph_s = CompressedRistretto(eph_s_bytes)
+        .decompress()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_s")
+        })?;
+    reject_identity(&eph_s, "eph_s")?; // [FIX-7]
+
+    // [FIX-3] Constant-time pinned key comparison
+    if pinned_server_pub
+        .compress()
+        .to_bytes()
+        .ct_eq(&server_static_pub.compress().to_bytes())
+        .unwrap_u8()
+        == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Server pubkey mismatch — possible MITM",
+        ));
     }
 
-    let ok = schnorr_verify_server(&server_static_pub, &a_s, &s_s, &nonce_s, &eph_s);
-    println!("Client[AUTH]: Server Schnorr authentication = {}", ok);
-    if !ok {
-        eprintln!("Client[AUTH]: Authentication FAILED");
+    if !schnorr_verify_server(&server_static_pub, &a_s, &s_s, &nonce_s, &eph_s) {
+        eprintln!("Client[AUTH]: Server Schnorr proof FAILED");
         x.zeroize();
         eph_secret.zeroize();
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server Schnorr proof invalid",
+        ));
     }
+    println!("Client[AUTH]: Server Schnorr proof OK");
 
-    let session_key = derive_session_key(&eph_secret, &eph_s, &nonce_c, &nonce_s, &device_id, &eph_pub, &eph_s);
-    let th = kc_transcript_hash(&device_id, &a_c, &s_c, &nonce_c, &eph_pub, &server_static_pub, &a_s, &s_s, &nonce_s, &eph_s);
+    // [FIX-8] Pass x25519_shared_bytes into session key derivation
+    let session_key = derive_session_key(
+        &eph_secret, &eph_s, &nonce_c, &nonce_s,
+        &device_id, &eph_pub, &eph_s, &x25519_shared_bytes,
+    );
+    let th = kc_transcript_hash(
+        &device_id, &a_c, &s_c, &nonce_c, &eph_pub,
+        &server_static_pub, &a_s, &s_s, &nonce_s, &eph_s,
+    );
     let (k_s2c, k_c2s) = derive_kc_keys(&session_key, &th);
 
     let expected_tag_s = hmac_tag(&k_s2c, b"server finished", &th);
-    if expected_tag_s != tag_s {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "tag_s mismatch"));
+
+    // [FIX-3] Constant-time tag comparison
+    if expected_tag_s.ct_eq(&tag_s).unwrap_u8() == 0 {
+        x.zeroize();
+        eph_secret.zeroize();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server finished tag mismatch",
+        ));
     }
     println!("Client[AUTH]: Key confirmation (server finished) OK");
 
-    // 4. SEND ENCRYPTED CLIENT CONFIRMATION (tag_c)
+    // ── 4. Send encrypted client confirmation ────────────────────────────────
     let tag_c = hmac_tag(&k_c2s, b"client finished", &th);
-    
-    // MUST increment nonce because we are reusing the TX key
-    let mut nonce_tx_2_bytes = [0u8; 12];
-    nonce_tx_2_bytes[0] = 1; 
-    let nonce_tx_2 = Nonce::from_slice(&nonce_tx_2_bytes);
 
-    let ct3 = cipher_tx.encrypt(nonce_tx_2, tag_c.as_ref()).unwrap();
+    // [FIX-2] Proper error propagation; [FIX-9] NonceCounter manages nonce
+    let ct3 = cipher_tx
+        .encrypt(&nonce_tx_ctr.next(), tag_c.as_ref())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encryption failed"))?;
+
     let len3 = (ct3.len() as u32).to_le_bytes();
     send_all(&mut stream, &len3, &mut sent)?;
     send_all(&mut stream, &ct3, &mut sent)?;
@@ -682,24 +812,32 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     x.zeroize();
     eph_secret.zeroize();
 
-    println!("CLIENT METRICS -> Duration: {:?}, Sent: {} bytes, Received: {} bytes", start.elapsed(), sent, recv);
+    println!(
+        "CLIENT METRICS -> Duration: {:?}, Sent: {} bytes, Received: {} bytes",
+        start.elapsed(), sent, recv,
+    );
     Ok(())
 }
 
-// ----------------------------------------------------
+// ============================================================
 // MAIN
-// ----------------------------------------------------
+// ============================================================
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut server_addr = "127.0.0.1:4000".to_string();
     let mut do_setup_flag = false;
+    // [FIX-1] Optional pairing token for SETUP
+    let mut pairing_token: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--server" => {
                 if i + 1 >= args.len() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--server missing value"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--server missing value",
+                    ));
                 }
                 server_addr = args[i + 1].clone();
                 i += 2;
@@ -708,16 +846,37 @@ fn main() -> std::io::Result<()> {
                 do_setup_flag = true;
                 i += 1;
             }
+            // [FIX-1] Accept pairing token from CLI
+            "--pairing-token" => {
+                if i + 1 >= args.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--pairing-token missing value",
+                    ));
+                }
+                pairing_token = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--provision-bootstrap" => {
                 if i + 2 >= args.len() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--provision-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--provision-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>",
+                    ));
                 }
                 let id_hex = args[i + 1].clone();
                 let secret_hex = args[i + 2].clone();
-                let id_dec = hex::decode(&id_hex).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex"))?;
-                let sec_dec = hex::decode(&secret_hex).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex"))?;
+                let id_dec = hex::decode(&id_hex).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex")
+                })?;
+                let sec_dec = hex::decode(&secret_hex).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex")
+                })?;
                 if id_dec.len() != BOOTSTRAP_ID_LEN || sec_dec.len() != BOOTSTRAP_SECRET_LEN {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bootstrap values must both be 32 bytes"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "bootstrap values must both be 32 bytes",
+                    ));
                 }
                 let mut id = [0u8; BOOTSTRAP_ID_LEN];
                 let mut sec = [0u8; BOOTSTRAP_SECRET_LEN];
@@ -729,24 +888,40 @@ fn main() -> std::io::Result<()> {
             }
             "--pin-server-pub" => {
                 if i + 1 >= args.len() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pin-server-pub missing value"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--pin-server-pub missing value",
+                    ));
                 }
                 let hex_str = args[i + 1].clone();
-                let decoded = hex::decode(&hex_str).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex"))?;
+                let decoded = hex::decode(&hex_str).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex")
+                })?;
                 if decoded.len() != 32 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "pinned key must be 32 bytes"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "pinned key must be 32 bytes",
+                    ));
                 }
                 let mut key_bytes = [0u8; 32];
                 key_bytes.copy_from_slice(&decoded);
+                // [FIX-2] No unwrap
                 let p = CompressedRistretto(key_bytes).decompress().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid ristretto point")
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid ristretto point",
+                    )
                 })?;
+                reject_identity(&p, "pinned server pub")?;
                 save_server_pub(&p)?;
                 println!("Client: Successfully pinned server pubkey out-of-band.");
                 i += 2;
             }
             _ => {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown argument"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown argument: {}", args[i]),
+                ))
             }
         }
     }
@@ -754,7 +929,7 @@ fn main() -> std::io::Result<()> {
     if !creds_exist() && !do_setup_flag {
         eprintln!(
             "Client: device root missing ({}). Refusing AUTH. Run with --setup to enroll.",
-            DEVICE_ROOT_FILE
+            DEVICE_ROOT_FILE,
         );
         return Ok(());
     }
@@ -766,7 +941,8 @@ fn main() -> std::io::Result<()> {
             println!("Client[SETUP/ZTP]: No device root found; generating NEW device root.");
         }
         let (device_id, x) = load_device_creds_from_root()?;
-        do_setup(&server_addr, device_id, x)?;
+        // [FIX-1] Pass pairing token through to do_setup
+        do_setup(&server_addr, device_id, x, pairing_token.as_deref())?;
         return Ok(());
     }
 
