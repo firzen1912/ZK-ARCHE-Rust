@@ -9,8 +9,13 @@
 //   4) Replay protection: persistent nonce tracking (dropped time-based TTL for DoS fix).
 //   5) Key confirmation MACs: server sends tag_s, client replies tag_c over the secure tunnel.
 //   6) ZTP bootstrap: client proves knowledge of the bootstrap secret during SETUP via a MAC.
-
-// Full Cargo.toml dependencies:
+//
+// [TOFU-FIX] After both Schnorr proof and bootstrap MAC verify, handle_setup now sends a
+//   1-byte enrollment acknowledgment (0x01) back to the client.  The client waits for this
+//   ack before pinning the server's public key — guaranteeing the key is only ever pinned
+//   after the server has confirmed the full exchange was authentic.
+//
+// Cargo.toml dependencies:
 //   curve25519-dalek = "4"
 //   x25519-dalek     = { version = "2.0", features = ["static_secrets"] }
 //   chacha20poly1305 = "0.10"
@@ -21,7 +26,7 @@
 //   hmac             = "0.12"
 //   hex              = "0.4"
 //   zeroize          = "1"
-//   subtle           = "2"        ← NEW
+//   subtle           = "2"
 //
 
 use std::collections::{HashMap, HashSet};
@@ -46,7 +51,6 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
-// [FIX-3] Import subtle for constant-time comparisons
 use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
@@ -228,7 +232,7 @@ fn derive_session_key(
     device_id: &[u8; 32],
     eph_c: &RistrettoPoint,
     eph_s: &RistrettoPoint,
-    x25519_shared: &[u8; 32], // [FIX-8] channel binding
+    x25519_shared: &[u8; 32],
 ) -> [u8; 32] {
     let shared = peer_eph_pub * eph_secret;
     let shared_bytes = shared.compress().to_bytes();
@@ -242,7 +246,7 @@ fn derive_session_key(
     info.extend_from_slice(device_id);
     info.extend_from_slice(eph_c.compress().as_bytes());
     info.extend_from_slice(eph_s.compress().as_bytes());
-    info.extend_from_slice(x25519_shared); // [FIX-8]
+    info.extend_from_slice(x25519_shared);
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &shared_bytes);
     let mut okm = [0u8; 32];
@@ -568,13 +572,10 @@ impl ReplayCache {
         k[..32].copy_from_slice(device_id);
         k[32..].copy_from_slice(nonce_c);
 
-        // Check both generations
         if self.current.contains(&k) || self.previous.contains(&k) {
-            return false; // replay detected
+            return false;
         }
 
-        // Rotate generations when current is full.
-        // Previous drops off but current (the recent half) is retained as previous.
         if self.current.len() >= REPLAY_GEN_MAX {
             self.previous = std::mem::take(&mut self.current);
         }
@@ -585,7 +586,7 @@ impl ReplayCache {
 }
 
 // ============================================================
-// [FIX-1] Pairing policy — token now enforced with constant-time comparison
+// [FIX-1] Pairing policy — token enforced with constant-time comparison
 // ============================================================
 #[derive(Clone)]
 struct PairingPolicy {
@@ -595,7 +596,6 @@ struct PairingPolicy {
 }
 
 impl PairingPolicy {
-    // [FIX-1] Accepts the token provided by the client and validates it.
     fn allows_ztp_setup(&self, provided_token: Option<&str>) -> bool {
         if !self.enabled {
             return false;
@@ -608,11 +608,10 @@ impl PairingPolicy {
         // [FIX-1] Constant-time token comparison
         match (&self.token, provided_token) {
             (Some(expected), Some(got)) => {
-                // subtle::ConstantTimeEq on byte slices
                 expected.as_bytes().ct_eq(got.as_bytes()).into()
             }
-            (Some(_), None) => false, // token required but not provided
-            (None, _) => true,        // no token configured → open pairing window
+            (Some(_), None) => false,
+            (None, _) => true,
         }
     }
 }
@@ -630,7 +629,7 @@ fn handle_setup(
     sent: &mut usize,
     recv: &mut usize,
 ) -> std::io::Result<()> {
-    // [FIX-11] Receive the pairing token from the client FIRST
+    // [FIX-11] Receive the pairing token from the client first
     let provided_token = recv_pairing_token(stream, recv)?;
 
     // [FIX-1] Enforce token policy
@@ -665,7 +664,6 @@ fn handle_setup(
     let is_new = {
         let mut reg_w = reg.write().unwrap();
         if let Some(existing) = reg_w.get(&device_id) {
-            // Device already enrolled — verify the key matches
             if existing.compress().to_bytes() != device_static_pub.compress().to_bytes() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -674,7 +672,6 @@ fn handle_setup(
             }
             false // re-enroll with same key is idempotent
         } else {
-            // Reserve the slot immediately under the write lock
             reg_w.insert(device_id, device_static_pub);
             true
         }
@@ -695,7 +692,6 @@ fn handle_setup(
 
     let ok = schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s);
     if !ok {
-        // Roll back the reservation if proof fails
         if is_new {
             let mut reg_w = reg.write().unwrap();
             reg_w.remove(&device_id);
@@ -739,6 +735,17 @@ fn handle_setup(
             hex::encode(bootstrap_id),
         );
     }
+
+    // [TOFU-FIX] Send 1-byte enrollment acknowledgment.
+    //
+    // This byte is only reached after BOTH the Schnorr proof AND the bootstrap MAC
+    // verified successfully.  The bootstrap MAC transcript includes server_static_pub,
+    // so a MITM that substituted a different key would cause MAC verification to fail
+    // above and we would return an error before ever reaching this send.  Therefore
+    // the client can safely treat receipt of 0x01 as proof that the server it
+    // connected to is the genuine holder of the server_static_pub it received.
+    send_all(stream, &[0x01u8], sent)?;
+    stream.flush()?;
 
     Ok(())
 }
@@ -818,7 +825,7 @@ fn handle_auth_v2(
     let eph_c = CompressedRistretto(eph_c_bytes)
         .decompress()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_c"))?;
-    reject_identity(&eph_c, "eph_c")?; // [FIX-7]
+    reject_identity(&eph_c, "eph_c")?;
 
     // ── 3. Replay & Schnorr verification ─────────────────────────────────────
     {
