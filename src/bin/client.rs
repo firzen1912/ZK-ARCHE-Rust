@@ -826,8 +826,9 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut server_addr = "127.0.0.1:4000".to_string();
     let mut do_setup_flag = false;
-    // [FIX-1] Optional pairing token for SETUP
     let mut pairing_token: Option<String> = None;
+    let mut did_pin_server_pub = false;
+    let mut did_provision_bootstrap = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -846,7 +847,6 @@ fn main() -> std::io::Result<()> {
                 do_setup_flag = true;
                 i += 1;
             }
-            // [FIX-1] Accept pairing token from CLI
             "--pairing-token" => {
                 if i + 1 >= args.len() {
                     return Err(std::io::Error::new(
@@ -884,6 +884,7 @@ fn main() -> std::io::Result<()> {
                 sec.copy_from_slice(&sec_dec);
                 save_bootstrap_material(&id, &sec)?;
                 println!("Client: saved bootstrap_id and bootstrap_secret.");
+                did_provision_bootstrap = true;
                 i += 3;
             }
             "--pin-server-pub" => {
@@ -905,7 +906,6 @@ fn main() -> std::io::Result<()> {
                 }
                 let mut key_bytes = [0u8; 32];
                 key_bytes.copy_from_slice(&decoded);
-                // [FIX-2] No unwrap
                 let p = CompressedRistretto(key_bytes).decompress().ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -915,6 +915,7 @@ fn main() -> std::io::Result<()> {
                 reject_identity(&p, "pinned server pub")?;
                 save_server_pub(&p)?;
                 println!("Client: Successfully pinned server pubkey out-of-band.");
+                did_pin_server_pub = true;
                 i += 2;
             }
             _ => {
@@ -924,6 +925,10 @@ fn main() -> std::io::Result<()> {
                 ))
             }
         }
+    }
+
+    if (did_pin_server_pub || did_provision_bootstrap) && !do_setup_flag {
+        return Ok(());
     }
 
     if !creds_exist() && !do_setup_flag {
@@ -941,7 +946,6 @@ fn main() -> std::io::Result<()> {
             println!("Client[SETUP/ZTP]: No device root found; generating NEW device root.");
         }
         let (device_id, x) = load_device_creds_from_root()?;
-        // [FIX-1] Pass pairing token through to do_setup
         do_setup(&server_addr, device_id, x, pairing_token.as_deref())?;
         return Ok(());
     }

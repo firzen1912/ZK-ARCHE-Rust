@@ -1080,6 +1080,7 @@ fn main() -> std::io::Result<()> {
     let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
     let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
     reject_identity(&server_static_pub, "server_static_pub")?;
+    println!("Server public key (pin this on client): {}", hex::encode(server_static_pub.compress().to_bytes()));
 
     println!("Server: Listening on {}", bind_addr);
     println!(
