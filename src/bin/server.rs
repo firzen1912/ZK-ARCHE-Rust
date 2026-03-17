@@ -1,32 +1,21 @@
 // ==============================
-// server.rs (V2: Schnorr Ristretto25519 + X25519 + ChaCha20-Poly1305 + HKDF + HMAC with ZTP bootstrap)
+// server.rs (V3: AUTH_V2 unchanged, SETUP upgraded to mutual certificate-based onboarding)
 // ==============================
 //
 // Goals:
-//   1) Let clients learn/pin server identity during SETUP by sending server_static_pub.
-//   2) Mutual auth: server proves possession of its static secret during AUTH.
-//   3) Zero Privacy: Hide identity via ECDHE (X25519) + ChaCha20Poly1305 tunnel during AUTH.
-//   4) Replay protection: persistent nonce tracking (dropped time-based TTL for DoS fix).
-//   5) Key confirmation MACs: server sends tag_s, client replies tag_c over the secure tunnel.
-//   6) ZTP bootstrap: client proves knowledge of the bootstrap secret during SETUP via a MAC.
+//   1) Keep AUTH_V2 unchanged for operational auth/session protection.
+//   2) Replace bootstrap-secret onboarding with mutual certificate validation during SETUP.
+//   3) Validate device certs against a trusted CA and bind device_id + device_static_pub.
+//   4) Present a CA-signed server cert that binds the same server_static_pub used by AUTH_V2.
+//   5) Preserve the final 0x01 enrollment ack after full server-side verification.
 //
-// [TOFU-FIX] After both Schnorr proof and bootstrap MAC verify, handle_setup now sends a
-//   1-byte enrollment acknowledgment (0x01) back to the client.  The client waits for this
-//   ack before pinning the server's public key — guaranteeing the key is only ever pinned
-//   after the server has confirmed the full exchange was authentic.
+// Certificate binding convention used here:
+//   - Device cert subject CN = lowercase hex(device_id)
+//   - Device cert subject OU = lowercase hex(device_static_pub_compressed)
+//   - Server cert subject OU = lowercase hex(server_static_pub_compressed)
 //
-// Cargo.toml dependencies:
-//   curve25519-dalek = "4"
-//   x25519-dalek     = { version = "2.0", features = ["static_secrets"] }
-//   chacha20poly1305 = "0.10"
-//   blake2           = "0.10"
-//   rand             = "0.8"
-//   sha2             = "0.10"
-//   hkdf             = "0.12"
-//   hmac             = "0.12"
-//   hex              = "0.4"
-//   zeroize          = "1"
-//   subtle           = "2"
+// Cargo.toml additions for this version:
+//   openssl          = { version = "0.10", features = ["vendored"] }
 //
 
 use std::collections::{HashMap, HashSet};
@@ -49,6 +38,13 @@ use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use openssl::hash::MessageDigest;
+use openssl::nid::Nid;
+use openssl::pkey::{PKey, Private, Public};
+use openssl::sign::{Signer, Verifier};
+use openssl::stack::Stack;
+use openssl::x509::store::X509StoreBuilder;
+use openssl::x509::{X509StoreContext, X509};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
 use subtle::ConstantTimeEq;
@@ -63,10 +59,11 @@ const MSG_AUTH_V2: u8 = 0x03;
 const REGISTRY_BIN: &str = "registry.bin";
 const REGISTRY_BAK: &str = "registry.bak";
 const SERVER_SK_FILE: &str = "server_sk.bin";
-const BOOTSTRAP_DB_FILE: &str = "bootstrap_registry.bin";
-const BOOTSTRAP_DB_BAK: &str = "bootstrap_registry.bak";
-const BOOTSTRAP_ID_LEN: usize = 32;
-const BOOTSTRAP_SECRET_LEN: usize = 32;
+const SERVER_CERT_FILE: &str = "server_cert.pem";
+const SERVER_CERT_KEY_FILE: &str = "server_cert_key.pem";
+const CA_CERT_FILE: &str = "ca_cert.pem";
+const MAX_CERT_BLOB: usize = 16 * 1024;
+const MAX_SIG_BLOB: usize = 4 * 1024;
 
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
 const T_CLIENT: &[u8] = b"client_schnorr_v1";
@@ -372,20 +369,40 @@ fn recv_encrypted_blob(
     Ok(buf)
 }
 
-fn recv_bootstrap_id(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<[u8; BOOTSTRAP_ID_LEN]> {
-    let len = recv_u8(stream, recv)?;
-    if len as usize != BOOTSTRAP_ID_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bootstrap_id wrong length",
-        ));
-    }
-    let mut id = [0u8; BOOTSTRAP_ID_LEN];
-    recv_exact(stream, &mut id, recv)?;
-    Ok(id)
+// [FIX-11] Receive the pairing token sent by the client during SETUP
+fn recv_u32_le(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    recv_exact(stream, &mut b, recv)?;
+    Ok(u32::from_le_bytes(b))
 }
 
-// [FIX-11] Receive the pairing token sent by the client during SETUP
+fn send_u32_le(stream: &mut impl Write, v: u32, sent: &mut usize) -> std::io::Result<()> {
+    send_all(stream, &v.to_le_bytes(), sent)
+}
+
+fn send_blob(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
+    send_u32_le(stream, buf.len() as u32, sent)?;
+    send_all(stream, buf, sent)
+}
+
+fn recv_blob(
+    stream: &mut impl Read,
+    recv: &mut usize,
+    max_len: usize,
+    what: &str,
+) -> std::io::Result<Vec<u8>> {
+    let len = recv_u32_le(stream, recv)? as usize;
+    if len > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} too large: {len} bytes (max {max_len})"),
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    recv_exact(stream, &mut buf, recv)?;
+    Ok(buf)
+}
+
 fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Option<String>> {
     let len = recv_u8(stream, recv)? as usize;
     if len == 0 {
@@ -447,90 +464,140 @@ fn save_registry_atomic(
     Ok(())
 }
 
-#[derive(Clone)]
-struct BootstrapRecord {
-    secret: [u8; 32],
+fn load_file(path: &str) -> std::io::Result<Vec<u8>> {
+    fs::read(path)
 }
 
-fn load_bootstrap_db(path: &str) -> std::io::Result<HashMap<[u8; 32], BootstrapRecord>> {
-    let mut db = HashMap::new();
-    let data = fs::read(path).unwrap_or_default();
-    for chunk in data.chunks_exact(64) {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&chunk[0..32]);
-        let mut secret = [0u8; 32];
-        secret.copy_from_slice(&chunk[32..64]);
-        db.insert(id, BootstrapRecord { secret });
-    }
-    Ok(db)
+fn load_x509_from_file(path: &str) -> std::io::Result<X509> {
+    let data = load_file(path)?;
+    X509::from_pem(&data)
+        .or_else(|_| X509::from_der(&data))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("failed to load X509 from {path}: {e}")))
 }
 
-fn save_bootstrap_db_atomic(
-    path: &str,
-    bak_path: &str,
-    db: &HashMap<[u8; 32], BootstrapRecord>,
-) -> std::io::Result<()> {
-    if Path::new(path).exists() {
-        let _ = fs::copy(path, bak_path);
+fn load_private_key_from_file(path: &str) -> std::io::Result<PKey<Private>> {
+    let data = load_file(path)?;
+    PKey::private_key_from_pem(&data)
+        .or_else(|_| PKey::private_key_from_der(&data))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("failed to load private key from {path}: {e}")))
+}
+
+fn x509_to_der(cert: &X509) -> std::io::Result<Vec<u8>> {
+    cert.to_der().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("cert DER encode failed: {e}")))
+}
+
+fn subject_hex_entry(cert: &X509, nid: Nid, what: &str) -> std::io::Result<String> {
+    let subject = cert.subject_name();
+    let entry = subject.entries_by_nid(nid).next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate missing {what}"))
+    })?;
+    let txt = entry
+        .data()
+        .as_utf8()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad {what} utf8: {e}")))?;
+    Ok(txt.to_string().to_lowercase())
+}
+
+fn cert_bound_ristretto_pub(cert: &X509, what: &str) -> std::io::Result<RistrettoPoint> {
+    let hex_str = subject_hex_entry(cert, Nid::ORGANIZATIONALUNITNAME, what)?;
+    let decoded = hex::decode(&hex_str)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid {what} hex")))?;
+    if decoded.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{what} must be 32 bytes compressed ristretto"),
+        ));
     }
-    let tmp = format!("{path}.tmp");
-    let mut out = Vec::with_capacity(db.len() * 64);
-    for (id, rec) in db {
-        out.extend_from_slice(id);
-        out.extend_from_slice(&rec.secret);
+    let mut bb = [0u8; 32];
+    bb.copy_from_slice(&decoded);
+    let p = CompressedRistretto(bb)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid {what} point")))?;
+    reject_identity(&p, what)?;
+    Ok(p)
+}
+
+fn verify_cert_signed_by_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
+    let mut builder = X509StoreBuilder::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("X509StoreBuilder::new failed: {e}")))?;
+    builder.add_cert(ca_cert.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add CA cert failed: {e}")))?;
+    let store = builder.build();
+    let chain = Stack::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("X509 chain alloc failed: {e}")))?;
+    let mut ctx = X509StoreContext::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("X509StoreContext::new failed: {e}")))?;
+    let verified = ctx
+        .init(&store, cert, &chain, |c| c.verify_cert())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("certificate chain verify failed: {e}")))?;
+    if !verified {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "certificate chain verification returned false",
+        ));
     }
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&out)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn ztp_mac_transcript(
-    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+fn sign_transcript(key: &PKey<Private>, transcript_hash: &[u8; 32]) -> std::io::Result<Vec<u8>> {
+    let mut signer = Signer::new(MessageDigest::sha256(), key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Signer::new failed: {e}")))?;
+    signer
+        .update(transcript_hash)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Signer::update failed: {e}")))?;
+    signer
+        .sign_to_vec()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Signer::sign_to_vec failed: {e}")))
+}
+
+fn verify_transcript_signature(
+    cert: &X509,
+    transcript_hash: &[u8; 32],
+    sig: &[u8],
+) -> std::io::Result<()> {
+    let pubkey: PKey<Public> = cert
+        .public_key()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("extract cert public key failed: {e}")))?;
+    let mut verifier = Verifier::new(MessageDigest::sha256(), &pubkey)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Verifier::new failed: {e}")))?;
+    verifier
+        .update(transcript_hash)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Verifier::update failed: {e}")))?;
+    let ok = verifier
+        .verify(sig)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("signature verification failed: {e}")))?;
+    if !ok {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "transcript signature mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn ztp_cert_transcript_hash(
     device_id: &[u8; 32],
     device_static_pub: &RistrettoPoint,
-    server_static_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    device_cert_der: &[u8],
+    server_cert_der: &[u8],
 ) -> [u8; 32] {
-    let mut t = CompatTranscript::new(b"ztp-bootstrap-v1");
-    t.append_message(b"bootstrap_id", bootstrap_id);
+    let mut t = CompatTranscript::new(b"ztp-mutual-cert-v1");
     t.append_message(b"device_id", device_id);
     t.append_message(b"device_pub", device_static_pub.compress().as_bytes());
-    t.append_message(b"server_pub", server_static_pub.compress().as_bytes());
     t.append_message(b"client_nonce", client_nonce);
     t.append_message(b"server_nonce", server_nonce);
+    let dev_hash = Sha256::digest(device_cert_der);
+    let srv_hash = Sha256::digest(server_cert_der);
+    t.append_message(b"device_cert_hash", &dev_hash);
+    t.append_message(b"server_cert_hash", &srv_hash);
     let mut h = Sha256::new();
     sha2::Digest::update(&mut h, &t.buf);
     let out = h.finalize();
     let mut th = [0u8; 32];
     th.copy_from_slice(&out);
     th
-}
-
-fn compute_bootstrap_mac(
-    bootstrap_secret: &[u8; BOOTSTRAP_SECRET_LEN],
-    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
-    device_id: &[u8; 32],
-    device_static_pub: &RistrettoPoint,
-    server_static_pub: &RistrettoPoint,
-    client_nonce: &[u8; 32],
-    server_nonce: &[u8; 32],
-) -> [u8; 32] {
-    let th = ztp_mac_transcript(
-        bootstrap_id, device_id, device_static_pub,
-        server_static_pub, client_nonce, server_nonce,
-    );
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(bootstrap_secret).expect("HMAC key size ok");
-    mac.update(b"ztp-bootstrap-mac");
-    mac.update(&th);
-    let out = mac.finalize().into_bytes();
-    let mut tag = [0u8; 32];
-    tag.copy_from_slice(&out);
-    tag
 }
 
 fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
@@ -624,15 +691,14 @@ fn handle_setup(
     stream: &mut TcpStream,
     policy: &PairingPolicy,
     server_static_pub: &RistrettoPoint,
+    server_cert_der: &[u8],
+    server_cert_key_der: &[u8],
+    ca_cert_der: &[u8],
     reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    bootstrap_db: &Arc<RwLock<HashMap<[u8; 32], BootstrapRecord>>>,
     sent: &mut usize,
     recv: &mut usize,
 ) -> std::io::Result<()> {
-    // [FIX-11] Receive the pairing token from the client first
     let provided_token = recv_pairing_token(stream, recv)?;
-
-    // [FIX-1] Enforce token policy
     if !policy.allows_ztp_setup(provided_token.as_deref()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -640,27 +706,43 @@ fn handle_setup(
         ));
     }
 
-    let bootstrap_id = recv_bootstrap_id(stream, recv)?;
-    let bootstrap_secret = {
-        let db_r = bootstrap_db.read().unwrap();
-        match db_r.get(&bootstrap_id) {
-            Some(rec) => rec.secret,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "unknown bootstrap_id",
-                ))
-            }
-        }
-    };
-
     let device_id = recv_device_id(stream, recv)?;
-    // [FIX-7] recv_point now calls reject_identity internally
     let device_static_pub = recv_point(stream, recv, "device_static_pub")?;
     let mut client_nonce = [0u8; 32];
     recv_exact(stream, &mut client_nonce, recv)?;
+    let device_cert_der = recv_blob(stream, recv, MAX_CERT_BLOB, "device cert")?;
 
-    // [FIX-6] Single write-lock for the entire check-and-insert (eliminates TOCTOU)
+    let device_cert = X509::from_der(&device_cert_der)
+        .or_else(|_| X509::from_pem(&device_cert_der))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid device cert encoding: {e}")))?;
+    let ca_cert = X509::from_der(ca_cert_der)
+        .or_else(|_| X509::from_pem(ca_cert_der))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid CA cert encoding: {e}")))?;
+    verify_cert_signed_by_ca(&device_cert, &ca_cert)?;
+
+    let cert_device_id_hex = subject_hex_entry(&device_cert, Nid::COMMONNAME, "device cert CN")?;
+    let claimed_device_id_hex = hex::encode(device_id);
+    if cert_device_id_hex != claimed_device_id_hex {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("device cert CN mismatch: expected {claimed_device_id_hex}, got {cert_device_id_hex}"),
+        ));
+    }
+
+    let cert_device_pub = cert_bound_ristretto_pub(&device_cert, "device cert OU")?;
+    if cert_device_pub
+        .compress()
+        .to_bytes()
+        .ct_eq(&device_static_pub.compress().to_bytes())
+        .unwrap_u8()
+        == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "device cert OU does not match claimed device_static_pub",
+        ));
+    }
+
     let is_new = {
         let mut reg_w = reg.write().unwrap();
         if let Some(existing) = reg_w.get(&device_id) {
@@ -670,7 +752,7 @@ fn handle_setup(
                     "device_id collision: key mismatch",
                 ));
             }
-            false // re-enroll with same key is idempotent
+            false
         } else {
             reg_w.insert(device_id, device_static_pub);
             true
@@ -679,19 +761,30 @@ fn handle_setup(
 
     let mut server_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut server_nonce);
+    let th = ztp_cert_transcript_hash(
+        &device_id,
+        &device_static_pub,
+        &client_nonce,
+        &server_nonce,
+        &device_cert_der,
+        server_cert_der,
+    );
 
-    send_all(stream, server_static_pub.compress().as_bytes(), sent)?;
+    let server_key = PKey::private_key_from_der(server_cert_key_der)
+        .or_else(|_| PKey::private_key_from_pem(server_cert_key_der))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid server cert private key: {e}")))?;
+    let server_sig = sign_transcript(&server_key, &th)?;
+
     send_all(stream, &server_nonce, sent)?;
+    send_blob(stream, server_cert_der, sent)?;
+    send_blob(stream, &server_sig, sent)?;
     stream.flush()?;
 
-    // [FIX-7] recv_point handles identity check
     let a = recv_point(stream, recv, "setup_a")?;
     let s = recv_scalar(stream, recv)?;
-    let mut bootstrap_mac = [0u8; 32];
-    recv_exact(stream, &mut bootstrap_mac, recv)?;
+    let device_sig = recv_blob(stream, recv, MAX_SIG_BLOB, "device signature")?;
 
-    let ok = schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s);
-    if !ok {
+    if !schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s) {
         if is_new {
             let mut reg_w = reg.write().unwrap();
             reg_w.remove(&device_id);
@@ -702,51 +795,25 @@ fn handle_setup(
         ));
     }
 
-    let expected_mac = compute_bootstrap_mac(
-        &bootstrap_secret, &bootstrap_id, &device_id,
-        &device_static_pub, server_static_pub, &client_nonce, &server_nonce,
-    );
+    verify_transcript_signature(&device_cert, &th, &device_sig)?;
 
-    // [FIX-3] Constant-time MAC comparison
-    if expected_mac.ct_eq(&bootstrap_mac).unwrap_u8() == 0 {
-        if is_new {
-            let mut reg_w = reg.write().unwrap();
-            reg_w.remove(&device_id);
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "bootstrap MAC invalid",
-        ));
-    }
-
-    // Persist only if the device is truly new (Schnorr + MAC both passed)
     if is_new {
         let reg_r = reg.read().unwrap();
         save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_r)?;
         println!(
-            "Server[SETUP/ZTP]: enrolled NEW device_id={} bootstrap_id={}",
+            "Server[SETUP/MTLS]: enrolled NEW device_id={} via certificate",
             hex::encode(device_id),
-            hex::encode(bootstrap_id),
         );
     } else {
         println!(
-            "Server[SETUP/ZTP]: validated existing device_id={} bootstrap_id={}",
+            "Server[SETUP/MTLS]: validated existing device_id={} via certificate",
             hex::encode(device_id),
-            hex::encode(bootstrap_id),
         );
     }
 
-    // [TOFU-FIX] Send 1-byte enrollment acknowledgment.
-    //
-    // This byte is only reached after BOTH the Schnorr proof AND the bootstrap MAC
-    // verified successfully.  The bootstrap MAC transcript includes server_static_pub,
-    // so a MITM that substituted a different key would cause MAC verification to fail
-    // above and we would return an error before ever reaching this send.  Therefore
-    // the client can safely treat receipt of 0x01 as proof that the server it
-    // connected to is the genuine holder of the server_static_pub it received.
     send_all(stream, &[0x01u8], sent)?;
     stream.flush()?;
-
+    let _ = server_static_pub;
     Ok(())
 }
 
@@ -938,7 +1005,9 @@ fn handle_client(
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
     reg: Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    bootstrap_db: Arc<RwLock<HashMap<[u8; 32], BootstrapRecord>>>,
+    server_cert_der: Arc<Vec<u8>>,
+    server_cert_key_der: Arc<Vec<u8>>,
+    ca_cert_der: Arc<Vec<u8>>,
     replay: Arc<Mutex<ReplayCache>>,
 ) {
     let start = Instant::now();
@@ -967,8 +1036,15 @@ fn handle_client(
 
     let res = match msg_type {
         MSG_SETUP => handle_setup(
-            &mut stream, &policy, &server_static_pub,
-            &reg, &bootstrap_db, &mut sent, &mut recv_bytes,
+            &mut stream,
+            &policy,
+            &server_static_pub,
+            server_cert_der.as_ref(),
+            server_cert_key_der.as_ref(),
+            ca_cert_der.as_ref(),
+            &reg,
+            &mut sent,
+            &mut recv_bytes,
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             &mut stream, &server_static_secret, &server_static_pub,
@@ -1000,7 +1076,6 @@ fn main() -> std::io::Result<()> {
     let mut pairing = false;
     let mut pairing_token: Option<String> = None;
     let mut pairing_seconds: Option<u64> = None;
-    let mut add_bootstrap: Option<([u8; 32], [u8; 32])> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1032,32 +1107,6 @@ fn main() -> std::io::Result<()> {
                 })?);
                 i += 2;
             }
-            "--add-bootstrap" => {
-                if i + 2 >= args.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--add-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>",
-                    ));
-                }
-                let id_dec = hex::decode(&args[i + 1]).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex")
-                })?;
-                let sec_dec = hex::decode(&args[i + 2]).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex")
-                })?;
-                if id_dec.len() != BOOTSTRAP_ID_LEN || sec_dec.len() != BOOTSTRAP_SECRET_LEN {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "bootstrap values must both be 32 bytes",
-                    ));
-                }
-                let mut id = [0u8; 32];
-                let mut sec = [0u8; 32];
-                id.copy_from_slice(&id_dec);
-                sec.copy_from_slice(&sec_dec);
-                add_bootstrap = Some((id, sec));
-                i += 3;
-            }
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1070,32 +1119,43 @@ fn main() -> std::io::Result<()> {
     let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
 
-    let mut bootstrap_map = load_bootstrap_db(BOOTSTRAP_DB_FILE).unwrap_or_default();
-    if let Some((id, secret)) = add_bootstrap {
-        bootstrap_map.insert(id, BootstrapRecord { secret });
-        save_bootstrap_db_atomic(BOOTSTRAP_DB_FILE, BOOTSTRAP_DB_BAK, &bootstrap_map)?;
-        println!("Server: added bootstrap_id={} to {}", hex::encode(id), BOOTSTRAP_DB_FILE);
-        return Ok(());
-    }
-
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
     let reg = Arc::new(RwLock::new(reg_map));
-    let bootstrap_db = Arc::new(RwLock::new(bootstrap_map));
     let replay = Arc::new(Mutex::new(ReplayCache::default()));
     let listener = TcpListener::bind(&bind_addr)?;
 
     let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
     let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
     reject_identity(&server_static_pub, "server_static_pub")?;
-    println!("Server public key (pin this on client): {}", hex::encode(server_static_pub.compress().to_bytes()));
 
+    let server_cert = load_x509_from_file(SERVER_CERT_FILE)?;
+    let server_cert_der = Arc::new(x509_to_der(&server_cert)?);
+    let server_cert_key_der = Arc::new(load_file(SERVER_CERT_KEY_FILE)?);
+    let ca_cert = load_x509_from_file(CA_CERT_FILE)?;
+    let ca_cert_der = Arc::new(x509_to_der(&ca_cert)?);
+    verify_cert_signed_by_ca(&server_cert, &ca_cert)?;
+
+    let cert_server_pub = cert_bound_ristretto_pub(&server_cert, "server cert OU")?;
+    if cert_server_pub
+        .compress()
+        .to_bytes()
+        .ct_eq(&server_static_pub.compress().to_bytes())
+        .unwrap_u8()
+        == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server cert OU does not match server_sk.bin-derived server_static_pub",
+        ));
+    }
+
+    println!("Server public key (AUTH_V2 / cert-bound): {}", hex::encode(server_static_pub.compress().to_bytes()));
     println!("Server: Listening on {}", bind_addr);
     println!(
-        "Server: pairing_enabled={} token_configured={} deadline={:?} bootstrap_db_entries={}",
+        "Server: pairing_enabled={} token_configured={} deadline={:?} mutual_cert_setup=true",
         policy.enabled,
         policy.token.is_some(),
         policy.deadline,
-        bootstrap_db.read().unwrap().len(),
     );
 
     let ss = Arc::new(server_static_secret);
@@ -1107,11 +1167,13 @@ fn main() -> std::io::Result<()> {
         let sp2 = Arc::clone(&sp);
         let pol2 = policy.clone();
         let reg2 = Arc::clone(&reg);
-        let bootstrap2 = Arc::clone(&bootstrap_db);
+        let sc2 = Arc::clone(&server_cert_der);
+        let sk2 = Arc::clone(&server_cert_key_der);
+        let ca2 = Arc::clone(&ca_cert_der);
         let rep2 = Arc::clone(&replay);
 
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, bootstrap2, rep2);
+            handle_client(stream, ss2, sp2, pol2, reg2, sc2, sk2, ca2, rep2);
         });
     }
 }
