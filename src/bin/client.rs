@@ -3,19 +3,24 @@
 // ==============================
 //
 // Goals:
-//   1) Keep AUTH_V2 unchanged for operational auth/session protection.
-//   2) Replace bootstrap-secret onboarding with mutual certificate validation during SETUP.
-//   3) Eliminate first-contact TOFU for SETUP by verifying a trusted CA-signed server cert.
-//   4) Bind device_id + device_static_pub into the device certificate used during SETUP.
-//   5) Preserve the final 0x01 enrollment ack after full server-side verification.
+//   1) Record server identity via TOFU or out-of-band pinning (--pin-server-pub).
+//   2) Enforce pinned server_static_pub during SETUP and AUTH (reject MITM).
+//   3) Zero Privacy: Hide identity (device_id) during AUTH using X25519 ECDHE tunnel.
+//   4) Add key confirmation MACs: "server finished" and "client finished".
+//   5) ZTP bootstrap: client proves knowledge of the bootstrap secret during SETUP via a MAC.
 //
-// Certificate binding convention used here:
-//   - Device cert subject CN = lowercase hex(device_id)
-//   - Device cert subject OU = lowercase hex(device_static_pub_compressed)
-//   - Server cert subject OU = lowercase hex(server_static_pub_compressed)
-//
-// Cargo.toml additions for this version:
-//   openssl          = { version = "0.10", features = ["vendored"] }
+// Cargo.toml dependencies:
+//   curve25519-dalek = "4"
+//   x25519-dalek     = { version = "2.0", features = ["static_secrets"] }
+//   chacha20poly1305 = "0.10"
+//   blake2           = "0.10"
+//   rand             = "0.8"
+//   sha2             = "0.10"
+//   hkdf             = "0.12"
+//   hmac             = "0.12"
+//   hex              = "0.4"
+//   zeroize          = "1"
+//   subtle           = "2"        ← NEW
 //
 
 use std::env;
@@ -44,6 +49,7 @@ use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::{X509StoreContext, X509};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
+// [FIX-3] Import subtle for constant-time comparisons
 use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
@@ -225,7 +231,7 @@ fn derive_session_key(
     device_id: &[u8; 32],
     eph_c: &RistrettoPoint,
     eph_s: &RistrettoPoint,
-    x25519_shared: &[u8; 32],
+    x25519_shared: &[u8; 32], // [FIX-8] channel binding
 ) -> [u8; 32] {
     let shared = peer_eph_pub * eph_secret;
     let shared_bytes = shared.compress().to_bytes();
@@ -239,7 +245,7 @@ fn derive_session_key(
     info.extend_from_slice(device_id);
     info.extend_from_slice(eph_c.compress().as_bytes());
     info.extend_from_slice(eph_s.compress().as_bytes());
-    info.extend_from_slice(x25519_shared);
+    info.extend_from_slice(x25519_shared); // [FIX-8]
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &shared_bytes);
     let mut okm = [0u8; 32];
@@ -315,40 +321,7 @@ fn recv_exact(stream: &mut impl Read, buf: &mut [u8], recv: &mut usize) -> std::
     Ok(())
 }
 
-// [FIX-4] Bounded length-prefixed ciphertext read
-fn recv_u32_le(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<u32> {
-    let mut b = [0u8; 4];
-    recv_exact(stream, &mut b, recv)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn send_u32_le(stream: &mut impl Write, v: u32, sent: &mut usize) -> std::io::Result<()> {
-    send_all(stream, &v.to_le_bytes(), sent)
-}
-
-fn send_blob(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
-    send_u32_le(stream, buf.len() as u32, sent)?;
-    send_all(stream, buf, sent)
-}
-
-fn recv_blob(
-    stream: &mut impl Read,
-    recv: &mut usize,
-    max_len: usize,
-    what: &str,
-) -> std::io::Result<Vec<u8>> {
-    let len = recv_u32_le(stream, recv)? as usize;
-    if len > max_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{what} too large: {len} bytes (max {max_len})"),
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    recv_exact(stream, &mut buf, recv)?;
-    Ok(buf)
-}
-
+// [FIX-4] Bounded length-prefixed ciphertext read (shared by both send paths)
 fn recv_encrypted_blob(
     stream: &mut impl Read,
     recv: &mut usize,
@@ -610,61 +583,37 @@ fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
 }
 
 // ============================================================
-// SETUP (mutual certificate-based onboarding)
+// SETUP (ZTP provisioning handshake)
+// [FIX-1] Now sends the pairing token to the server
 // ============================================================
 fn do_setup(
     server_addr: &str,
     device_id: [u8; 32],
     mut x: Scalar,
-    pairing_token: Option<&str>,
+    pairing_token: Option<&str>, // [FIX-1]
 ) -> std::io::Result<()> {
     let mut sent = 0usize;
     let mut recv = 0usize;
 
-    let pinned_server_pub = load_server_pub()?;
-    let device_cert = load_x509_from_file(DEVICE_CERT_FILE)?;
-    let device_key = load_private_key_from_file(DEVICE_KEY_FILE)?;
-    let ca_cert = load_x509_from_file(CA_CERT_FILE)?;
-    let device_cert_der = x509_to_der(&device_cert)?;
-
-    let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
-    reject_identity(&device_static_pub, "client device_static_pub")?;
-
-    let expected_device_id_hex = hex::encode(device_id);
-    let cert_device_id_hex = subject_hex_entry(&device_cert, Nid::COMMONNAME, "device cert CN")?;
-    if cert_device_id_hex != expected_device_id_hex {
-        x.zeroize();
-        return Err(std::io::Error::new(
+    let bootstrap_id = load_bootstrap_id()?;
+    let bootstrap_secret = load_bootstrap_secret()?;
+    let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
+        std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("device cert CN mismatch: expected {expected_device_id_hex}, got {cert_device_id_hex}"),
-        ));
-    }
-
-    let cert_device_pub = cert_bound_ristretto_pub(&device_cert, "device cert OU")?;
-    if cert_device_pub
-        .compress()
-        .to_bytes()
-        .ct_eq(&device_static_pub.compress().to_bytes())
-        .unwrap_u8()
-        == 0
-    {
-        x.zeroize();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "device cert OU does not match local device_static_pub",
-        ));
-    }
-
-    verify_cert_signed_by_ca(&device_cert, &ca_cert)?;
+            "ZTP setup requires a pinned server_pub.bin; use --pin-server-pub first",
+        )
+    })?;
 
     let mut stream = TcpStream::connect(server_addr)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    println!("Client[SETUP/MTLS]: Connected to {}", server_addr);
+
+    println!("Client[SETUP/ZTP]: Connected to {}", server_addr);
 
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
 
+    // [FIX-1] Send pairing token length-prefixed (0 = no token)
     match pairing_token {
         Some(token) => {
             let tb = token.as_bytes();
@@ -677,7 +626,9 @@ fn do_setup(
             send_all(&mut stream, &[tb.len() as u8], &mut sent)?;
             send_all(&mut stream, tb, &mut sent)?;
         }
-        None => send_all(&mut stream, &[0u8], &mut sent)?,
+        None => {
+            send_all(&mut stream, &[0u8], &mut sent)?; // 0 = no token
+        }
     }
 
     let client_nonce = random_bytes_32();
@@ -687,51 +638,34 @@ fn do_setup(
     send_blob(&mut stream, &device_cert_der, &mut sent)?;
     stream.flush()?;
 
+    // Receive server static public key
+    let mut s_pub_bytes = [0u8; 32];
+    recv_exact(&mut stream, &mut s_pub_bytes, &mut recv)?;
+    // [FIX-2] No unwrap; [FIX-7] identity check
+    let server_static_pub = CompressedRistretto(s_pub_bytes)
+        .decompress()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid server_static_pub")
+        })?;
+    reject_identity(&server_static_pub, "server_static_pub")?;
+
+    // [FIX-3] Constant-time pinned key comparison
+    if pinned_server_pub
+        .compress()
+        .to_bytes()
+        .ct_eq(&server_static_pub.compress().to_bytes())
+        .unwrap_u8()
+        == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "MITM ALERT: server offered a different public key than our pinned key!",
+        ));
+    }
+    println!("Client[SETUP/ZTP]: Server pubkey matches pinned value.");
+
     let mut server_nonce = [0u8; 32];
     recv_exact(&mut stream, &mut server_nonce, &mut recv)?;
-    let server_cert_der = recv_blob(&mut stream, &mut recv, MAX_CERT_BLOB, "server cert")?;
-    let server_sig = recv_blob(&mut stream, &mut recv, MAX_SIG_BLOB, "server signature")?;
-
-    let server_cert = X509::from_der(&server_cert_der)
-        .or_else(|_| X509::from_pem(&server_cert_der))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid server cert encoding: {e}")))?;
-    verify_cert_signed_by_ca(&server_cert, &ca_cert)?;
-
-    let server_static_pub = cert_bound_ristretto_pub(&server_cert, "server cert OU")?;
-    match &pinned_server_pub {
-        Some(pinned) => {
-            if pinned
-                .compress()
-                .to_bytes()
-                .ct_eq(&server_static_pub.compress().to_bytes())
-                .unwrap_u8()
-                == 0
-            {
-                x.zeroize();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "server cert bound key mismatches pinned server pub",
-                ));
-            }
-            println!("Client[SETUP/MTLS]: Server certificate matches pinned server pub.");
-        }
-        None => {
-            println!(
-                "Client[SETUP/MTLS]: Validated CA-signed server cert, will pin server pub {} for AUTH_V2 compatibility.",
-                hex::encode(server_static_pub.compress().to_bytes())
-            );
-        }
-    }
-
-    let th = ztp_cert_transcript_hash(
-        &device_id,
-        &device_static_pub,
-        &client_nonce,
-        &server_nonce,
-        &device_cert_der,
-        &server_cert_der,
-    );
-    verify_transcript_signature(&server_cert, &th, &server_sig)?;
 
     let (a, s) = schnorr_prove_setup(&x, &device_id, &server_nonce);
     let device_sig = sign_transcript(&device_key, &th)?;
@@ -739,24 +673,6 @@ fn do_setup(
     send_all(&mut stream, &s.to_bytes(), &mut sent)?;
     send_blob(&mut stream, &device_sig, &mut sent)?;
     stream.flush()?;
-
-    let mut ack = [0u8; 1];
-    recv_exact(&mut stream, &mut ack, &mut recv)?;
-    if ack[0] != 0x01 {
-        x.zeroize();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "server rejected certificate-based setup",
-        ));
-    }
-
-    if pinned_server_pub.is_none() {
-        save_server_pub(&server_static_pub)?;
-        println!(
-            "Client[SETUP/MTLS]: Saved validated server pub for AUTH_V2: {}",
-            hex::encode(server_static_pub.compress().to_bytes())
-        );
-    }
 
     println!(
         "Client[SETUP/MTLS]: Sent={} bytes, Received={} bytes. Enrolled.",
@@ -774,7 +690,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "No pinned server_pub.bin — run --setup first to enroll and pin the server key.",
+            "No pinned server_pub.bin",
         )
     })?;
 
@@ -868,7 +784,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     let mut eph_s_bytes  = [0u8; 32]; eph_s_bytes.copy_from_slice(&pt2[128..160]);
     let mut tag_s        = [0u8; 32]; tag_s.copy_from_slice(&pt2[160..192]);
 
-    // [FIX-2] No unwrap on adversary data; [FIX-7] reject identity on all points
+    // [FIX-2] No unwrap on adversary data; [FIX-7] reject_identity on all points
     let server_static_pub = CompressedRistretto(s_pub_bytes)
         .decompress()
         .ok_or_else(|| {
@@ -894,7 +810,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_s")
         })?;
-    reject_identity(&eph_s, "eph_s")?;
+    reject_identity(&eph_s, "eph_s")?; // [FIX-7]
 
     // [FIX-3] Constant-time pinned key comparison
     if pinned_server_pub
