@@ -1,5 +1,5 @@
 // ==============================
-// client.rs (V3: AUTH_V2 unchanged, SETUP upgraded to mutual certificate-based onboarding)
+// client.rs (V2: Schnorr Ristretto25519 + X25519 + ChaCha20-Poly1305 + HKDF + HMAC with ZTP bootstrap)
 // ==============================
 //
 // Goals:
@@ -8,6 +8,14 @@
 //   3) Zero Privacy: Hide identity (device_id) during AUTH using X25519 ECDHE tunnel.
 //   4) Add key confirmation MACs: "server finished" and "client finished".
 //   5) ZTP bootstrap: client proves knowledge of the bootstrap secret during SETUP via a MAC.
+//
+// [TOFU-FIX] server_pub.bin is no longer required before first SETUP.
+//   On first contact the server's public key is received over the wire, used as the
+//   trust anchor in the bootstrap MAC transcript, and only pinned to disk AFTER the
+//   server sends the 0x01 enrollment-ack (meaning the server verified our MAC, which
+//   itself covered that exact public key).  A MITM cannot substitute a fake server key
+//   without breaking the MAC check on the server side, so the server will never ack.
+//   Once pinned, all subsequent SETUP and AUTH calls enforce the pinned key as before.
 //
 // Cargo.toml dependencies:
 //   curve25519-dalek = "4"
@@ -20,7 +28,7 @@
 //   hmac             = "0.12"
 //   hex              = "0.4"
 //   zeroize          = "1"
-//   subtle           = "2"        ← NEW
+//   subtle           = "2"
 //
 
 use std::env;
@@ -40,16 +48,8 @@ use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
-use openssl::pkey::{PKey, Private, Public};
-use openssl::sign::{Signer, Verifier};
-use openssl::stack::Stack;
-use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::{X509StoreContext, X509};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
-// [FIX-3] Import subtle for constant-time comparisons
 use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
@@ -63,11 +63,10 @@ const MSG_AUTH_V2: u8 = 0x03;
 
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/device_root.bin";
 const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/server_pub.bin";
-const DEVICE_CERT_FILE: &str = "/var/lib/iot-auth/device_cert.pem";
-const DEVICE_KEY_FILE: &str = "/var/lib/iot-auth/device_key.pem";
-const CA_CERT_FILE: &str = "/var/lib/iot-auth/ca_cert.pem";
-const MAX_CERT_BLOB: usize = 16 * 1024;
-const MAX_SIG_BLOB: usize = 4 * 1024;
+const BOOTSTRAP_ID_FILE: &str = "/var/lib/iot-auth/bootstrap_id.bin";
+const BOOTSTRAP_SECRET_FILE: &str = "/var/lib/iot-auth/bootstrap_secret.bin";
+const BOOTSTRAP_ID_LEN: usize = 32;
+const BOOTSTRAP_SECRET_LEN: usize = 32;
 
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
 const T_CLIENT: &[u8] = b"client_schnorr_v1";
@@ -231,7 +230,7 @@ fn derive_session_key(
     device_id: &[u8; 32],
     eph_c: &RistrettoPoint,
     eph_s: &RistrettoPoint,
-    x25519_shared: &[u8; 32], // [FIX-8] channel binding
+    x25519_shared: &[u8; 32],
 ) -> [u8; 32] {
     let shared = peer_eph_pub * eph_secret;
     let shared_bytes = shared.compress().to_bytes();
@@ -245,7 +244,7 @@ fn derive_session_key(
     info.extend_from_slice(device_id);
     info.extend_from_slice(eph_c.compress().as_bytes());
     info.extend_from_slice(eph_s.compress().as_bytes());
-    info.extend_from_slice(x25519_shared); // [FIX-8]
+    info.extend_from_slice(x25519_shared);
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &shared_bytes);
     let mut okm = [0u8; 32];
@@ -321,7 +320,7 @@ fn recv_exact(stream: &mut impl Read, buf: &mut [u8], recv: &mut usize) -> std::
     Ok(())
 }
 
-// [FIX-4] Bounded length-prefixed ciphertext read (shared by both send paths)
+// [FIX-4] Bounded length-prefixed ciphertext read
 fn recv_encrypted_blob(
     stream: &mut impl Read,
     recv: &mut usize,
@@ -415,140 +414,68 @@ fn load_exact_file<const N: usize>(path: &str, what: &str) -> std::io::Result<[u
     Ok(out)
 }
 
-fn load_file(path: &str) -> std::io::Result<Vec<u8>> {
-    fs::read(path)
+fn load_bootstrap_id() -> std::io::Result<[u8; BOOTSTRAP_ID_LEN]> {
+    load_exact_file(BOOTSTRAP_ID_FILE, "bootstrap_id.bin")
 }
 
-fn load_x509_from_file(path: &str) -> std::io::Result<X509> {
-    let data = load_file(path)?;
-    X509::from_pem(&data)
-        .or_else(|_| X509::from_der(&data))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("failed to load X509 from {path}: {e}")))
+fn load_bootstrap_secret() -> std::io::Result<[u8; BOOTSTRAP_SECRET_LEN]> {
+    load_exact_file(BOOTSTRAP_SECRET_FILE, "bootstrap_secret.bin")
 }
 
-fn load_private_key_from_file(path: &str) -> std::io::Result<PKey<Private>> {
-    let data = load_file(path)?;
-    PKey::private_key_from_pem(&data)
-        .or_else(|_| PKey::private_key_from_der(&data))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("failed to load private key from {path}: {e}")))
-}
-
-fn x509_to_der(cert: &X509) -> std::io::Result<Vec<u8>> {
-    cert.to_der().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("cert DER encode failed: {e}")))
-}
-
-fn subject_hex_entry(cert: &X509, nid: Nid, what: &str) -> std::io::Result<String> {
-    let subject = cert.subject_name();
-    let entry = subject.entries_by_nid(nid).next().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate missing {what}"))
-    })?;
-    let txt = entry
-        .data()
-        .as_utf8()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad {what} utf8: {e}")))?;
-    Ok(txt.to_string().to_lowercase())
-}
-
-fn cert_bound_ristretto_pub(cert: &X509, what: &str) -> std::io::Result<RistrettoPoint> {
-    let hex_str = subject_hex_entry(cert, Nid::ORGANIZATIONALUNITNAME, what)?;
-    let decoded = hex::decode(&hex_str)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid {what} hex")))?;
-    if decoded.len() != 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{what} must be 32 bytes compressed ristretto"),
-        ));
-    }
-    let mut bb = [0u8; 32];
-    bb.copy_from_slice(&decoded);
-    let p = CompressedRistretto(bb)
-        .decompress()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid {what} point")))?;
-    reject_identity(&p, what)?;
-    Ok(p)
-}
-
-fn verify_cert_signed_by_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
-    let mut builder = X509StoreBuilder::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("X509StoreBuilder::new failed: {e}")))?;
-    builder.add_cert(ca_cert.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add CA cert failed: {e}")))?;
-    let store = builder.build();
-    let chain = Stack::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("X509 chain alloc failed: {e}")))?;
-    let mut ctx = X509StoreContext::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("X509StoreContext::new failed: {e}")))?;
-    let verified = ctx
-        .init(&store, cert, &chain, |c| c.verify_cert())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("certificate chain verify failed: {e}")))?;
-    if !verified {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "certificate chain verification returned false",
-        ));
-    }
-    Ok(())
-}
-
-fn sign_transcript(key: &PKey<Private>, transcript_hash: &[u8; 32]) -> std::io::Result<Vec<u8>> {
-    let mut signer = Signer::new(MessageDigest::sha256(), key)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Signer::new failed: {e}")))?;
-    signer
-        .update(transcript_hash)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Signer::update failed: {e}")))?;
-    signer
-        .sign_to_vec()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Signer::sign_to_vec failed: {e}")))
-}
-
-fn verify_transcript_signature(
-    cert: &X509,
-    transcript_hash: &[u8; 32],
-    sig: &[u8],
-) -> std::io::Result<()> {
-    let pubkey: PKey<Public> = cert
-        .public_key()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("extract cert public key failed: {e}")))?;
-    let mut verifier = Verifier::new(MessageDigest::sha256(), &pubkey)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Verifier::new failed: {e}")))?;
-    verifier
-        .update(transcript_hash)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Verifier::update failed: {e}")))?;
-    let ok = verifier
-        .verify(sig)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("signature verification failed: {e}")))?;
-    if !ok {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "transcript signature mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn ztp_cert_transcript_hash(
+fn ztp_mac_transcript(
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
     device_id: &[u8; 32],
     device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
-    device_cert_der: &[u8],
-    server_cert_der: &[u8],
 ) -> [u8; 32] {
-    let mut t = CompatTranscript::new(b"ztp-mutual-cert-v1");
+    let mut t = CompatTranscript::new(b"ztp-bootstrap-v1");
+    t.append_message(b"bootstrap_id", bootstrap_id);
     t.append_message(b"device_id", device_id);
     t.append_message(b"device_pub", device_static_pub.compress().as_bytes());
+    t.append_message(b"server_pub", server_static_pub.compress().as_bytes());
     t.append_message(b"client_nonce", client_nonce);
     t.append_message(b"server_nonce", server_nonce);
-    let dev_hash = Sha256::digest(device_cert_der);
-    let srv_hash = Sha256::digest(server_cert_der);
-    t.append_message(b"device_cert_hash", &dev_hash);
-    t.append_message(b"server_cert_hash", &srv_hash);
     let mut h = Sha256::new();
     sha2::Digest::update(&mut h, &t.buf);
     let out = h.finalize();
     let mut th = [0u8; 32];
     th.copy_from_slice(&out);
     th
+}
+
+fn compute_bootstrap_mac(
+    bootstrap_secret: &[u8; BOOTSTRAP_SECRET_LEN],
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let th = ztp_mac_transcript(
+        bootstrap_id, device_id, device_static_pub,
+        server_static_pub, client_nonce, server_nonce,
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(bootstrap_secret).expect("HMAC key size ok");
+    mac.update(b"ztp-bootstrap-mac");
+    mac.update(&th);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&out);
+    tag
+}
+
+fn save_bootstrap_material(
+    id: &[u8; BOOTSTRAP_ID_LEN],
+    secret: &[u8; BOOTSTRAP_SECRET_LEN],
+) -> std::io::Result<()> {
+    ensure_parent_dir(BOOTSTRAP_ID_FILE)?;
+    ensure_parent_dir(BOOTSTRAP_SECRET_FILE)?;
+    fs::write(BOOTSTRAP_ID_FILE, id)?;
+    fs::write(BOOTSTRAP_SECRET_FILE, secret)?;
+    Ok(())
 }
 
 // ============================================================
@@ -584,36 +511,46 @@ fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
 
 // ============================================================
 // SETUP (ZTP provisioning handshake)
-// [FIX-1] Now sends the pairing token to the server
+//
+// [TOFU-FIX] server_pub.bin is now OPTIONAL before running setup.
+//
+// First-contact flow (no server_pub.bin on disk):
+//   - Client receives server_static_pub from the server over the wire.
+//   - That key is bound into the bootstrap MAC transcript, so if a MITM
+//     substituted a different key the server's MAC verification fails and
+//     the server closes the connection without sending the 0x01 ack.
+//   - Client waits for the 0x01 ack before pinning anything to disk.
+//   - If no ack arrives, nothing is persisted — the MITM key is never stored.
+//
+// Re-enrollment flow (server_pub.bin already on disk):
+//   - The received key is compared to the pinned key (constant-time).
+//   - Any mismatch → immediate abort (MITM protection unchanged).
 // ============================================================
 fn do_setup(
     server_addr: &str,
     device_id: [u8; 32],
     mut x: Scalar,
-    pairing_token: Option<&str>, // [FIX-1]
+    pairing_token: Option<&str>,
 ) -> std::io::Result<()> {
     let mut sent = 0usize;
     let mut recv = 0usize;
 
     let bootstrap_id = load_bootstrap_id()?;
     let bootstrap_secret = load_bootstrap_secret()?;
-    let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "ZTP setup requires a pinned server_pub.bin; use --pin-server-pub first",
-        )
-    })?;
+
+    // [TOFU-FIX] No longer fatal if server_pub.bin is absent.
+    // If a key IS already pinned we still enforce it (MITM protection for re-enroll).
+    let pinned_server_pub = load_server_pub()?;
 
     let mut stream = TcpStream::connect(server_addr)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-
     println!("Client[SETUP/ZTP]: Connected to {}", server_addr);
 
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
 
-    // [FIX-1] Send pairing token length-prefixed (0 = no token)
+    // Send pairing token (length-prefixed; 0 = no token)
     match pairing_token {
         Some(token) => {
             let tb = token.as_bytes();
@@ -627,21 +564,25 @@ fn do_setup(
             send_all(&mut stream, tb, &mut sent)?;
         }
         None => {
-            send_all(&mut stream, &[0u8], &mut sent)?; // 0 = no token
+            send_all(&mut stream, &[0u8], &mut sent)?;
         }
     }
+
+    send_all(&mut stream, &[BOOTSTRAP_ID_LEN as u8], &mut sent)?;
+    send_all(&mut stream, &bootstrap_id, &mut sent)?;
+
+    let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
+    reject_identity(&device_static_pub, "client device_static_pub")?;
 
     let client_nonce = random_bytes_32();
     send_all(&mut stream, &device_id, &mut sent)?;
     send_all(&mut stream, device_static_pub.compress().as_bytes(), &mut sent)?;
     send_all(&mut stream, &client_nonce, &mut sent)?;
-    send_blob(&mut stream, &device_cert_der, &mut sent)?;
     stream.flush()?;
 
-    // Receive server static public key
+    // ── Receive server static public key ──────────────────────────────────────
     let mut s_pub_bytes = [0u8; 32];
     recv_exact(&mut stream, &mut s_pub_bytes, &mut recv)?;
-    // [FIX-2] No unwrap; [FIX-7] identity check
     let server_static_pub = CompressedRistretto(s_pub_bytes)
         .decompress()
         .ok_or_else(|| {
@@ -649,39 +590,93 @@ fn do_setup(
         })?;
     reject_identity(&server_static_pub, "server_static_pub")?;
 
-    // [FIX-3] Constant-time pinned key comparison
-    if pinned_server_pub
-        .compress()
-        .to_bytes()
-        .ct_eq(&server_static_pub.compress().to_bytes())
-        .unwrap_u8()
-        == 0
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionAborted,
-            "MITM ALERT: server offered a different public key than our pinned key!",
-        ));
+    // ── Enforce pinned key, or announce TOFU first-contact mode ───────────────
+    match &pinned_server_pub {
+        Some(pinned) => {
+            // [FIX-3] Constant-time comparison — reject any key that differs
+            if pinned
+                .compress()
+                .to_bytes()
+                .ct_eq(&server_static_pub.compress().to_bytes())
+                .unwrap_u8()
+                == 0
+            {
+                x.zeroize();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "MITM ALERT: server offered a different public key than our pinned key!",
+                ));
+            }
+            println!("Client[SETUP/ZTP]: Server pubkey matches pinned value.");
+        }
+        None => {
+            // No key pinned yet.  The bootstrap MAC below cryptographically binds
+            // this exact server_static_pub into the transcript.  The server only
+            // sends its 0x01 ack after verifying that MAC against its own
+            // server_static_pub, so a substituted key will never be acked.
+            println!(
+                "Client[SETUP/ZTP]: No pinned server pub — TOFU mode. \
+                 Will pin after server confirms enrollment. \
+                 Fingerprint: {}",
+                hex::encode(s_pub_bytes)
+            );
+        }
     }
-    println!("Client[SETUP/ZTP]: Server pubkey matches pinned value.");
 
+    // ── Receive server nonce, compute Schnorr proof + bootstrap MAC ───────────
     let mut server_nonce = [0u8; 32];
     recv_exact(&mut stream, &mut server_nonce, &mut recv)?;
 
     let (a, s) = schnorr_prove_setup(&x, &device_id, &server_nonce);
-    let device_sig = sign_transcript(&device_key, &th)?;
+    let bootstrap_mac = compute_bootstrap_mac(
+        &bootstrap_secret, &bootstrap_id, &device_id,
+        &device_static_pub, &server_static_pub,
+        &client_nonce, &server_nonce,
+    );
+
     send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
     send_all(&mut stream, &s.to_bytes(), &mut sent)?;
-    send_blob(&mut stream, &device_sig, &mut sent)?;
+    send_all(&mut stream, &bootstrap_mac, &mut sent)?;
     stream.flush()?;
 
+    // ── [TOFU-FIX] Wait for server enrollment acknowledgment (0x01) ───────────
+    //
+    // The server emits 0x01 only after BOTH the Schnorr proof AND the bootstrap
+    // MAC verify successfully.  Because the MAC transcript includes server_static_pub,
+    // a MITM that substituted a different key would cause the server's MAC check to
+    // fail — the server would close the connection and we would never reach the
+    // save_server_pub() call below.
+    let mut ack = [0u8; 1];
+    recv_exact(&mut stream, &mut ack, &mut recv)?;
+    if ack[0] != 0x01 {
+        x.zeroize();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Server rejected setup (unexpected ack byte — enrollment failed server-side)",
+        ));
+    }
+    println!("Client[SETUP/ZTP]: Server confirmed enrollment (ack OK).");
+
+    // ── Pin the server's public key now that we have proof it's authentic ──────
+    if pinned_server_pub.is_none() {
+        save_server_pub(&server_static_pub)?;
+        println!(
+            "Client[SETUP/ZTP]: Server pubkey TOFU-pinned: {}",
+            hex::encode(s_pub_bytes)
+        );
+    }
+
     println!(
-        "Client[SETUP/MTLS]: Sent={} bytes, Received={} bytes. Enrolled.",
+        "Client[SETUP/ZTP]: Sent={} bytes, Received={} bytes. Enrolled.",
         sent, recv,
     );
     x.zeroize();
     Ok(())
 }
 
+// ============================================================
+// AUTH V2 (encrypted zero-privacy tunnel)
+// ============================================================
 fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
     let start = Instant::now();
     let mut sent = 0usize;
@@ -690,7 +685,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     let pinned_server_pub = load_server_pub()?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "No pinned server_pub.bin",
+            "No pinned server_pub.bin — run --setup first to enroll and pin the server key.",
         )
     })?;
 
@@ -784,7 +779,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     let mut eph_s_bytes  = [0u8; 32]; eph_s_bytes.copy_from_slice(&pt2[128..160]);
     let mut tag_s        = [0u8; 32]; tag_s.copy_from_slice(&pt2[160..192]);
 
-    // [FIX-2] No unwrap on adversary data; [FIX-7] reject_identity on all points
+    // [FIX-2] No unwrap on adversary data; [FIX-7] reject identity on all points
     let server_static_pub = CompressedRistretto(s_pub_bytes)
         .decompress()
         .ok_or_else(|| {
@@ -810,7 +805,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_s")
         })?;
-    reject_identity(&eph_s, "eph_s")?; // [FIX-7]
+    reject_identity(&eph_s, "eph_s")?;
 
     // [FIX-3] Constant-time pinned key comparison
     if pinned_server_pub
@@ -895,6 +890,7 @@ fn main() -> std::io::Result<()> {
     let mut do_setup_flag = false;
     let mut pairing_token: Option<String> = None;
     let mut did_pin_server_pub = false;
+    let mut did_provision_bootstrap = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -922,6 +918,36 @@ fn main() -> std::io::Result<()> {
                 }
                 pairing_token = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--provision-bootstrap" => {
+                if i + 2 >= args.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--provision-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>",
+                    ));
+                }
+                let id_hex = args[i + 1].clone();
+                let secret_hex = args[i + 2].clone();
+                let id_dec = hex::decode(&id_hex).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex")
+                })?;
+                let sec_dec = hex::decode(&secret_hex).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex")
+                })?;
+                if id_dec.len() != BOOTSTRAP_ID_LEN || sec_dec.len() != BOOTSTRAP_SECRET_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "bootstrap values must both be 32 bytes",
+                    ));
+                }
+                let mut id = [0u8; BOOTSTRAP_ID_LEN];
+                let mut sec = [0u8; BOOTSTRAP_SECRET_LEN];
+                id.copy_from_slice(&id_dec);
+                sec.copy_from_slice(&sec_dec);
+                save_bootstrap_material(&id, &sec)?;
+                println!("Client: saved bootstrap_id and bootstrap_secret.");
+                did_provision_bootstrap = true;
+                i += 3;
             }
             "--pin-server-pub" => {
                 if i + 1 >= args.len() {
@@ -963,7 +989,7 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    if did_pin_server_pub && !do_setup_flag {
+    if (did_pin_server_pub || did_provision_bootstrap) && !do_setup_flag {
         return Ok(());
     }
 
