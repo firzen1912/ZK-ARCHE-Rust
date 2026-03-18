@@ -31,6 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::convert::TryFrom;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -56,7 +58,9 @@ use zeroize::Zeroize;
 
 use openssl::pkey::{Id as PKeyId, PKey, Private, Public};
 use openssl::sign::{Signer, Verifier};
-use openssl::x509::{X509, X509NameRef};
+use openssl::stack::Stack;
+use openssl::x509::store::X509StoreBuilder;
+use openssl::x509::{X509StoreContext, X509, X509NameRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -65,6 +69,7 @@ const MSG_AUTH_V2: u8 = 0x03;
 
 const REGISTRY_BIN: &str = "/var/lib/iot-auth/server/registry.bin";
 const REGISTRY_BAK: &str = "/var/lib/iot-auth/server/registry.bak";
+const REPLAY_CACHE_BIN: &str = "/var/lib/iot-auth/server/replay_cache.bin";
 const SERVER_SK_FILE: &str = "/var/lib/iot-auth/server/server_sk.bin";
 const SERVER_CERT_FILE: &str = "/var/lib/iot-auth/server/server_cert.pem";
 const SERVER_CERT_KEY_FILE: &str = "/var/lib/iot-auth/server/server_cert_key.pem";
@@ -431,12 +436,53 @@ fn save_registry_atomic(
         out.extend_from_slice(id);
         out.extend_from_slice(pk.compress().as_bytes());
     }
+    write_private_file_atomic(path, &out)?;
+    Ok(())
+}
+
+fn write_private_file_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let tmp = format!("{path}.tmp");
+    #[cfg(unix)]
     {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&out)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(data)?;
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_private_file_permissions(path: &str) -> std::io::Result<()> {
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{path} must not be group/world accessible (mode {:o})", mode),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_file_permissions(_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -461,10 +507,38 @@ fn load_private_key_from_bytes(buf: &[u8]) -> std::io::Result<PKey<Private>> {
 }
 
 fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
-    let ca_pub = ca_cert.public_key().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CA public key failed: {e}")))?;
-    cert.verify(&ca_pub)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate verify failed: {e}")))
-        .and_then(|ok| if ok { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA")) })
+    let now = openssl::asn1::Asn1Time::days_from_now(0)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("time init failed: {e}")))?;
+    if cert.not_before().compare(&now)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not_before compare failed: {e}")))?
+        .is_gt()
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate is not yet valid"));
+    }
+    if cert.not_after().compare(&now)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not_after compare failed: {e}")))?
+        .is_lt()
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate has expired"));
+    }
+
+    let mut store_builder = X509StoreBuilder::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("store builder failed: {e}")))?;
+    store_builder
+        .add_cert(ca_cert.to_owned())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add CA cert failed: {e}")))?;
+    let store = store_builder.build();
+    let chain = Stack::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chain init failed: {e}")))?;
+    let mut ctx = X509StoreContext::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("store context failed: {e}")))?;
+    let ok = ctx
+        .init(&store, cert, &chain, |c| c.verify_cert())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate path validation failed: {e}")))?;
+    if !ok {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA"));
+    }
+    Ok(())
 }
 
 fn cert_subject_field_hex(cert: &X509, nid: openssl::nid::Nid) -> std::io::Result<String> {
@@ -543,6 +617,7 @@ fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
 
 fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
     if Path::new(path).exists() {
+        verify_private_file_permissions(path)?;
         let b = fs::read(path)?;
         if b.len() != 32 {
             return Err(std::io::Error::new(
@@ -558,8 +633,7 @@ fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
         })
     } else {
         let sk = random_scalar();
-        ensure_parent_dir(path)?;
-        fs::write(path, sk.to_bytes())?;
+        write_private_file_atomic(path, &sk.to_bytes())?;
         Ok(sk)
     }
 }
@@ -574,15 +648,60 @@ struct ReplayCache {
 }
 
 impl ReplayCache {
+    fn load(path: &str) -> std::io::Result<Self> {
+        if !Path::new(path).exists() {
+            return Ok(Self::default());
+        }
+        let data = fs::read(path)?;
+        if data.len() < 8 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "replay cache truncated"));
+        }
+        let current_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let previous_count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let expected = 8 + (current_count + previous_count) * 64;
+        if data.len() != expected {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "replay cache length mismatch"));
+        }
+        let mut off = 8;
+        let mut current = HashSet::with_capacity(current_count);
+        let mut previous = HashSet::with_capacity(previous_count);
+        for _ in 0..current_count {
+            let mut entry = [0u8; 64];
+            entry.copy_from_slice(&data[off..off + 64]);
+            current.insert(entry);
+            off += 64;
+        }
+        for _ in 0..previous_count {
+            let mut entry = [0u8; 64];
+            entry.copy_from_slice(&data[off..off + 64]);
+            previous.insert(entry);
+            off += 64;
+        }
+        Ok(Self { current, previous })
+    }
+
+    fn persist(&self, path: &str) -> std::io::Result<()> {
+        let mut out = Vec::with_capacity(8 + (self.current.len() + self.previous.len()) * 64);
+        out.extend_from_slice(&(self.current.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.previous.len() as u32).to_le_bytes());
+        for entry in &self.current {
+            out.extend_from_slice(entry);
+        }
+        for entry in &self.previous {
+            out.extend_from_slice(entry);
+        }
+        write_private_file_atomic(path, &out)
+    }
+
     // Returns true if the nonce is fresh (not seen before), and records it.
     // Returns false if it is a replay.
-    fn check_and_insert(&mut self, device_id: &[u8; 32], nonce_c: &[u8; 32]) -> bool {
+    fn check_and_insert(&mut self, device_id: &[u8; 32], nonce_c: &[u8; 32], persist_path: &str) -> std::io::Result<bool> {
         let mut k = [0u8; 64];
         k[..32].copy_from_slice(device_id);
         k[32..].copy_from_slice(nonce_c);
 
         if self.current.contains(&k) || self.previous.contains(&k) {
-            return false;
+            return Ok(false);
         }
 
         if self.current.len() >= REPLAY_GEN_MAX {
@@ -590,7 +709,8 @@ impl ReplayCache {
         }
 
         self.current.insert(k);
-        true
+        self.persist(persist_path)?;
+        Ok(true)
     }
 }
 
@@ -744,7 +864,7 @@ fn handle_auth_v2(
     // Derive tunnel keys (libsodium crypto_kx order)
     let shared_secret = server_sk.diffie_hellman(&client_pk);
     // [FIX-8] Save raw shared secret bytes to bind into session key later
-    let x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
+    let mut x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
 
     let mut hasher = Blake2b512::new();
     hasher.update(shared_secret.as_bytes());
@@ -802,7 +922,7 @@ fn handle_auth_v2(
     // ── 3. Replay & Schnorr verification ─────────────────────────────────────
     {
         let mut rc = replay.lock().unwrap();
-        if !rc.check_and_insert(&device_id, &nonce_c) {
+        if !rc.check_and_insert(&device_id, &nonce_c, REPLAY_CACHE_BIN)? {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "replay detected",
@@ -837,7 +957,7 @@ fn handle_auth_v2(
     let (a_s, s_s) = schnorr_prove_server(server_static_secret, &nonce_s, &eph_s);
 
     // [FIX-8] Pass x25519_shared_bytes into session key derivation
-    let session_key = derive_session_key(
+    let mut session_key = derive_session_key(
         &eph_s_secret, &eph_c, &nonce_c, &nonce_s,
         &device_id, &eph_c, &eph_s, &x25519_shared_bytes,
     );
@@ -895,12 +1015,15 @@ fn handle_auth_v2(
     }
 
     println!(
-        "Server[AUTH]: device_id={} session_key={} KC=OK",
+        "Server[AUTH]: device_id={} KC=OK",
         hex::encode(device_id),
-        hex::encode(session_key),
     );
 
+    session_key.zeroize();
     eph_s_secret.zeroize();
+    tx_key.zeroize();
+    rx_key.zeroize();
+    x25519_shared_bytes.zeroize();
     Ok(())
 }
 
@@ -1015,6 +1138,8 @@ fn main() -> std::io::Result<()> {
     }
 
     let server_cert_buf = read_file_all(SERVER_CERT_FILE, MAX_CERT_FILE_SIZE)?;
+    verify_private_file_permissions(SERVER_SK_FILE)?;
+    verify_private_file_permissions(SERVER_CERT_KEY_FILE)?;
     let server_key_buf = read_file_all(SERVER_CERT_KEY_FILE, MAX_CERT_FILE_SIZE)?;
     let ca_cert_buf = read_file_all(CA_CERT_FILE, MAX_CERT_FILE_SIZE)?;
     let server_cert = load_cert_from_bytes(&server_cert_buf)?;
@@ -1030,7 +1155,8 @@ fn main() -> std::io::Result<()> {
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
     let reg = Arc::new(RwLock::new(reg_map));
-    let replay = Arc::new(Mutex::new(ReplayCache::default()));
+    let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
+    let replay = Arc::new(Mutex::new(replay_state));
     let listener = TcpListener::bind(&bind_addr)?;
 
     println!("C-compatible Rust Server listening on {}", bind_addr);

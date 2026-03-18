@@ -28,6 +28,8 @@
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -45,7 +47,9 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use openssl::pkey::{Id as PKeyId, PKey, Private, Public};
 use openssl::sign::{Signer, Verifier};
-use openssl::x509::{X509, X509NameRef};
+use openssl::stack::Stack;
+use openssl::x509::store::X509StoreBuilder;
+use openssl::x509::{X509StoreContext, X509, X509NameRef};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Sha256, Sha512};
 use subtle::ConstantTimeEq;
@@ -339,8 +343,55 @@ fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn write_private_file_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let tmp = format!("{path}.tmp");
+    #[cfg(unix)]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_private_file_permissions(path: &str) -> std::io::Result<()> {
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{path} must not be group/world accessible (mode {:o})", mode),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_file_permissions(_path: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn load_or_create_device_root() -> std::io::Result<[u8; 32]> {
     if Path::new(DEVICE_ROOT_FILE).exists() {
+        verify_private_file_permissions(DEVICE_ROOT_FILE)?;
         let b = fs::read(DEVICE_ROOT_FILE)?;
         if b.len() != 32 {
             return Err(std::io::Error::new(
@@ -352,9 +403,8 @@ fn load_or_create_device_root() -> std::io::Result<[u8; 32]> {
         root.copy_from_slice(&b);
         Ok(root)
     } else {
-        ensure_parent_dir(DEVICE_ROOT_FILE)?;
         let root = random_bytes_32();
-        fs::write(DEVICE_ROOT_FILE, root)?;
+        write_private_file_atomic(DEVICE_ROOT_FILE, &root)?;
         Ok(root)
     }
 }
@@ -416,21 +466,38 @@ fn load_private_key_from_bytes(buf: &[u8]) -> std::io::Result<PKey<Private>> {
 }
 
 fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
-    let ca_pub = ca_cert
-        .public_key()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CA public key failed: {e}")))?;
-    cert.verify(&ca_pub)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate verify failed: {e}")))
-        .and_then(|ok| {
-            if ok {
-                Ok(())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "certificate not issued by trusted CA",
-                ))
-            }
-        })
+    let now = openssl::asn1::Asn1Time::days_from_now(0)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("time init failed: {e}")))?;
+    if cert.not_before().compare(&now)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not_before compare failed: {e}")))?
+        .is_gt()
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate is not yet valid"));
+    }
+    if cert.not_after().compare(&now)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not_after compare failed: {e}")))?
+        .is_lt()
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate has expired"));
+    }
+
+    let mut store_builder = X509StoreBuilder::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("store builder failed: {e}")))?;
+    store_builder
+        .add_cert(ca_cert.to_owned())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add CA cert failed: {e}")))?;
+    let store = store_builder.build();
+    let chain = Stack::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chain init failed: {e}")))?;
+    let mut ctx = X509StoreContext::new()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("store context failed: {e}")))?;
+    let ok = ctx
+        .init(&store, cert, &chain, |c| c.verify_cert())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate path validation failed: {e}")))?;
+    if !ok {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA"));
+    }
+    Ok(())
 }
 
 fn cert_subject_field_hex(cert: &X509, nid: openssl::nid::Nid) -> std::io::Result<String> {
@@ -552,9 +619,7 @@ fn load_server_pub() -> std::io::Result<Option<RistrettoPoint>> {
 }
 
 fn save_server_pub(pubkey: &RistrettoPoint) -> std::io::Result<()> {
-    ensure_parent_dir(SERVER_PUB_FILE)?;
-    fs::write(SERVER_PUB_FILE, pubkey.compress().as_bytes())?;
-    Ok(())
+    write_private_file_atomic(SERVER_PUB_FILE, pubkey.compress().as_bytes())
 }
 
 // ============================================================
@@ -565,11 +630,13 @@ fn do_setup(
     device_id: [u8; 32],
     mut x: Scalar,
     pairing_token: Option<&str>,
+    allow_tofu_setup: bool,
 ) -> std::io::Result<()> {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv = 0usize;
 
+    verify_private_file_permissions(DEVICE_KEY_FILE)?;
     let device_cert_buf = read_file_all(DEVICE_CERT_FILE, MAX_CERT_FILE_SIZE)?;
     let device_key_buf = read_file_all(DEVICE_KEY_FILE, MAX_CERT_FILE_SIZE)?;
     let ca_cert_buf = read_file_all(CA_CERT_FILE, MAX_CERT_FILE_SIZE)?;
@@ -600,6 +667,13 @@ fn do_setup(
     }
 
     let pinned_server_pub = load_server_pub()?;
+    if pinned_server_pub.is_none() && !allow_tofu_setup {
+        x.zeroize();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "initial setup requires an out-of-band pinned server key; run --pin-server-pub first or use --allow-tofu-setup only in lab environments",
+        ));
+    }
 
     let mut stream = TcpStream::connect(server_addr)?;
     stream.set_nodelay(true)?;
@@ -703,6 +777,9 @@ fn do_setup(
     }
 
     save_server_pub(&server_static_pub)?;
+    if pinned_server_pub.is_none() {
+        println!("Client[SETUP/ZTP]: WARNING: trusted server key on first use for this enrollment.");
+    }
     println!(
         "Client[SETUP/ZTP]: Server certificate verified. Saved server_pub for AUTH_V2: {}",
         hex::encode(server_pub_bytes)
@@ -754,7 +831,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     let server_pk = X25519Public::from(server_pk_bytes);
 
     let shared_secret = client_sk.diffie_hellman(&server_pk);
-    let x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
+    let mut x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
 
     let mut hasher = Blake2b512::new();
     Digest::update(&mut hasher, shared_secret.as_bytes());
@@ -866,7 +943,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     }
     println!("Client[AUTH]: Server Schnorr proof OK");
 
-    let session_key = derive_session_key(
+    let mut session_key = derive_session_key(
         &eph_secret,
         &eph_s,
         &nonce_c,
@@ -915,6 +992,10 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 
     println!("Client[AUTH]: Sent encrypted client finished tag");
 
+    session_key.zeroize();
+    x25519_shared_bytes.zeroize();
+    tx_key.zeroize();
+    rx_key.zeroize();
     x.zeroize();
     eph_secret.zeroize();
 
@@ -933,7 +1014,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 fn usage(prog: &str) {
     eprintln!(
         "Usage:
-  {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN]
+  {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup]
   {0} --server 127.0.0.1:4000
   {0} --pin-server-pub <hex>
   {0} --print-device-identity",
@@ -959,6 +1040,7 @@ fn main() -> std::io::Result<()> {
     let mut do_setup_flag = false;
     let mut pairing_token: Option<String> = None;
     let mut print_identity = false;
+    let mut allow_tofu_setup = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -980,6 +1062,10 @@ fn main() -> std::io::Result<()> {
             }
             "--print-device-identity" => {
                 print_identity = true;
+                i += 1;
+            }
+            "--allow-tofu-setup" => {
+                allow_tofu_setup = true;
                 i += 1;
             }
             "--pairing-token" => {
@@ -1037,6 +1123,9 @@ fn main() -> std::io::Result<()> {
         return print_device_identity();
     }
 
+    if Path::new(DEVICE_ROOT_FILE).exists() { verify_private_file_permissions(DEVICE_ROOT_FILE)?; }
+    if Path::new(SERVER_PUB_FILE).exists() { verify_private_file_permissions(SERVER_PUB_FILE)?; }
+
     if !creds_exist() && !do_setup_flag {
         eprintln!(
             "Client: device root missing ({}). Run --setup to enroll.",
@@ -1057,7 +1146,7 @@ fn main() -> std::io::Result<()> {
                 "No device root found; generating NEW device root."
             }
         );
-        do_setup(&server_addr, device_id, x, pairing_token.as_deref())
+        do_setup(&server_addr, device_id, x, pairing_token.as_deref(), allow_tofu_setup)
     } else {
         do_auth_v2(&server_addr, device_id, x)
     }
