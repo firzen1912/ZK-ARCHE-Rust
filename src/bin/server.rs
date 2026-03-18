@@ -72,9 +72,7 @@ const REGISTRY_BIN: &str = "/var/lib/iot-auth/server/registry.bin";
 const REGISTRY_BAK: &str = "/var/lib/iot-auth/server/registry.bak";
 const REPLAY_CACHE_BIN: &str = "/var/lib/iot-auth/server/replay_cache.bin";
 const SERVER_SK_FILE: &str = "/var/lib/iot-auth/server/server_sk.bin";
-const SERVER_CERT_FILE: &str = "/var/lib/iot-auth/server/server_cert.pem";
-const SERVER_CERT_KEY_FILE: &str = "/var/lib/iot-auth/server/server_cert_key.pem";
-const CA_CERT_FILE: &str = "/var/lib/iot-auth/server/ca_cert.pem";
+const PROVISION_PSK_DB: &str = "/var/lib/iot-auth/server/provision_psk.bin";
 const MAX_CERT_FILE_SIZE: usize = 128 * 1024;
 const MAX_SIG_SIZE: usize = 8192;
 
@@ -452,6 +450,31 @@ fn save_registry_atomic(
     Ok(())
 }
 
+type PskDb = HashMap<[u8; 32], [u8; 32]>;
+
+fn load_psk_db(path: &str) -> std::io::Result<PskDb> {
+    let mut db = HashMap::new();
+    let data = fs::read(path).unwrap_or_default();
+    for chunk in data.chunks_exact(64) {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&chunk[0..32]);
+        let mut psk = [0u8; 32];
+        psk.copy_from_slice(&chunk[32..64]);
+        db.insert(id, psk);
+    }
+    Ok(db)
+}
+
+fn save_psk_db_atomic(path: &str, db: &PskDb) -> std::io::Result<()> {
+    ensure_parent_dir(path)?;
+    let mut out = Vec::with_capacity(db.len() * 64);
+    for (id, psk) in db {
+        out.extend_from_slice(id);
+        out.extend_from_slice(psk);
+    }
+    write_private_file_atomic(path, &out)
+}
+
 fn write_private_file_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
     ensure_parent_dir(path)?;
     let tmp = format!("{path}.tmp");
@@ -598,23 +621,24 @@ fn recv_blob(stream: &mut impl Read, max_len: usize, recv: &mut usize) -> std::i
     Ok(buf)
 }
 
-fn ztp_cert_transcript_hash(
+fn ztp_psk_transcript_hash(
     device_id: &[u8; 32],
     device_pub: &[u8; 32],
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
-    device_cert: &[u8],
-    server_cert: &[u8],
+    server_pub: &[u8; 32],
+    pairing_token: Option<&[u8]>,
 ) -> [u8; 32] {
-    let dev_hash = Sha256::digest(device_cert);
-    let srv_hash = Sha256::digest(server_cert);
-    let mut t = CompatTranscript::new(b"ztp-mutual-cert-v1");
+    let mut t = CompatTranscript::new(b"ztp-psk-v1");
     t.append_message(b"device_id", device_id);
     t.append_message(b"device_pub", device_pub);
     t.append_message(b"client_nonce", client_nonce);
     t.append_message(b"server_nonce", server_nonce);
-    t.append_message(b"device_cert_hash", &dev_hash);
-    t.append_message(b"server_cert_hash", &srv_hash);
+    t.append_message(b"server_pub", server_pub);
+    match pairing_token {
+        Some(tok) => t.append_message(b"pairing_token", tok),
+        None => t.append_message(b"pairing_token", b""),
+    }
     let out = Sha256::digest(&t.buf);
     let mut th = [0u8; 32];
     th.copy_from_slice(&out);
@@ -910,10 +934,7 @@ fn handle_setup(
     policy: &PairingPolicy,
     server_static_pub: &RistrettoPoint,
     reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    server_cert_buf: &[u8],
-    server_cert: &X509,
-    server_cert_key: &PKey<Private>,
-    ca_cert: &X509,
+    psk_db: &Arc<RwLock<PskDb>>,
     sent: &mut usize,
     recv: &mut usize,
     failures: &Arc<Mutex<FailureTracker>>,
@@ -933,20 +954,6 @@ fn handle_setup(
     let device_pub_bytes = device_static_pub.compress().to_bytes();
     let mut client_nonce = [0u8; 32];
     recv_exact(stream, &mut client_nonce, recv)?;
-    let device_cert_buf = recv_blob(stream, MAX_CERT_FILE_SIZE, recv)?;
-    let device_cert = load_cert_from_bytes(&device_cert_buf)?;
-    verify_cert_against_ca(&device_cert, ca_cert)?;
-
-    let expected_cn = hex::encode(device_id);
-    let expected_ou = hex::encode(device_pub_bytes);
-    require_eku(&device_cert, EKU_TLS_CLIENT_AUTH)?;
-    require_custom_identity_extension(&device_cert, DEVICE_IDENTITY_OID, &expected_cn)?;
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::COMMONNAME)? != expected_cn {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate CN mismatch"));
-    }
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_ou {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate OU mismatch"));
-    }
 
     {
         let reg_r = reg.read().unwrap();
@@ -957,33 +964,44 @@ fn handle_setup(
         }
     }
 
+    let provision_psk = {
+        let db_r = psk_db.read().unwrap();
+        db_r.get(&device_id).copied().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "unknown device_id for PSK provisioning")
+        })?
+    };
+
     let mut server_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut server_nonce);
-    let transcript_hash = ztp_cert_transcript_hash(
+    let server_pub_bytes = server_static_pub.compress().to_bytes();
+    let transcript_hash = ztp_psk_transcript_hash(
         &device_id,
         &device_pub_bytes,
         &client_nonce,
         &server_nonce,
-        &device_cert_buf,
-        server_cert_buf,
+        &server_pub_bytes,
+        provided_token.as_deref().map(|s| s.as_bytes()),
     );
-    let server_sig = sign_transcript_hash(server_cert_key, &transcript_hash)?;
+    let server_tag = hmac_tag(&provision_psk, b"server setup", &transcript_hash);
 
     send_all(stream, &server_nonce, sent)?;
-    send_blob(stream, server_cert_buf, sent)?;
-    send_blob(stream, &server_sig, sent)?;
+    send_all(stream, &server_pub_bytes, sent)?;
+    send_all(stream, &server_tag, sent)?;
     stream.flush()?;
 
     let a = recv_point(stream, recv, "setup_A")?;
     let s = recv_scalar(stream, recv)?;
-    let device_sig = recv_blob(stream, MAX_SIG_SIZE, recv)?;
+    let mut client_tag = [0u8; 32];
+    recv_exact(stream, &mut client_tag, recv)?;
 
     if !schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Schnorr proof invalid"));
     }
 
-    let device_cert_pubkey = device_cert.public_key().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("device pubkey extract failed: {e}")))?;
-    verify_transcript_hash_sig(&device_cert_pubkey, &transcript_hash, &device_sig)?;
+    let expected_client_tag = hmac_tag(&provision_psk, b"client setup", &transcript_hash);
+    if expected_client_tag.ct_eq(&client_tag).unwrap_u8() == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client PSK tag invalid"));
+    }
 
     let upsert = {
         let mut reg_w = reg.write().unwrap();
@@ -993,16 +1011,20 @@ fn handle_setup(
         !existed
     };
 
+    {
+        let mut db_w = psk_db.write().unwrap();
+        db_w.remove(&device_id);
+        save_psk_db_atomic(PROVISION_PSK_DB, &db_w)?;
+    }
+
     println!(
-        "Server[SETUP/ZTP]: {} device_id={} via mutual certificate onboarding",
+        "Server[SETUP/PSK]: {} device_id={} via per-device PSK onboarding",
         if upsert { "enrolled NEW" } else { "validated existing" },
         hex::encode(device_id),
     );
 
     send_all(stream, &[0x01u8], sent)?;
     stream.flush()?;
-    let _ = server_static_pub;
-    let _ = server_cert;
     Ok(())
 }
 
@@ -1211,10 +1233,7 @@ fn handle_client(
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
     reg: Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    server_cert_buf: Arc<Vec<u8>>,
-    server_cert_key: Arc<PKey<Private>>,
-    server_cert: Arc<X509>,
-    ca_cert: Arc<X509>,
+    psk_db: Arc<RwLock<PskDb>>,
     replay: Arc<Mutex<ReplayCache>>,
     failures: Arc<Mutex<FailureTracker>>,
     _active_guard: ActiveConnGuard,
@@ -1247,8 +1266,7 @@ fn handle_client(
     let res = match msg_type {
         MSG_SETUP => handle_setup(
             &mut stream, &policy, &server_static_pub,
-            &reg, &server_cert_buf, &server_cert, &server_cert_key, &ca_cert,
-            &mut sent, &mut recv_bytes, &failures, &peer_key,
+            &reg, &psk_db, &mut sent, &mut recv_bytes, &failures, &peer_key,
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             &mut stream, &server_static_secret, &server_static_pub,
@@ -1322,26 +1340,13 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    let server_cert_buf = read_file_all(SERVER_CERT_FILE, MAX_CERT_FILE_SIZE)?;
     verify_private_file_permissions(SERVER_SK_FILE)?;
-    verify_private_file_permissions(SERVER_CERT_KEY_FILE)?;
-    let server_key_buf = read_file_all(SERVER_CERT_KEY_FILE, MAX_CERT_FILE_SIZE)?;
-    let ca_cert_buf = read_file_all(CA_CERT_FILE, MAX_CERT_FILE_SIZE)?;
-    let server_cert = load_cert_from_bytes(&server_cert_buf)?;
-    let ca_cert = load_cert_from_bytes(&ca_cert_buf)?;
-    let server_cert_key = load_private_key_from_bytes(&server_key_buf)?;
-    verify_cert_against_ca(&server_cert, &ca_cert)?;
-    let expected_server_ou = hex::encode(server_static_pub.compress().to_bytes());
-    require_eku(&server_cert, EKU_TLS_SERVER_AUTH)?;
-    require_custom_identity_extension(&server_cert, SERVER_IDENTITY_OID, &expected_server_ou)?;
-    if cert_subject_field_hex(&server_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_server_ou {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server certificate OU does not match server_pub"));
-    }
-
     let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
     let reg = Arc::new(RwLock::new(reg_map));
+    let psk_map = load_psk_db(PROVISION_PSK_DB).unwrap_or_default();
+    let psk_db = Arc::new(RwLock::new(psk_map));
     let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
     let replay = Arc::new(Mutex::new(replay_state));
     let failures = Arc::new(Mutex::new(FailureTracker::default()));
@@ -1351,18 +1356,15 @@ fn main() -> std::io::Result<()> {
     println!("C-compatible Rust Server listening on {}", bind_addr);
     println!("Server public key (pin this on client): {}", hex::encode(server_static_pub.compress().to_bytes()));
     println!(
-        "Server: pairing_enabled={} token_configured={} deadline={} mutual_cert_onboarding=true",
+        "Server: pairing_enabled={} token_configured={} deadline={} per_device_psk_onboarding=true psk_entries={}",
         policy.enabled,
         policy.token.is_some(),
         if policy.deadline.is_some() { "set" } else { "none" },
+        psk_db.read().unwrap().len(),
     );
 
     let ss = Arc::new(server_static_secret);
     let sp = Arc::new(server_static_pub);
-    let server_cert_buf = Arc::new(server_cert_buf);
-    let server_cert_key = Arc::new(server_cert_key);
-    let server_cert = Arc::new(server_cert);
-    let ca_cert = Arc::new(ca_cert);
 
     loop {
         let (stream, _) = listener.accept()?;
@@ -1370,10 +1372,7 @@ fn main() -> std::io::Result<()> {
         let sp2 = Arc::clone(&sp);
         let pol2 = policy.clone();
         let reg2 = Arc::clone(&reg);
-        let scb2 = Arc::clone(&server_cert_buf);
-        let sck2 = Arc::clone(&server_cert_key);
-        let sc2 = Arc::clone(&server_cert);
-        let ca2 = Arc::clone(&ca_cert);
+        let psk2 = Arc::clone(&psk_db);
         let rep2 = Arc::clone(&replay);
         let failures2 = Arc::clone(&failures);
         let active2 = Arc::clone(&active_connections);
@@ -1383,7 +1382,7 @@ fn main() -> std::io::Result<()> {
             continue;
         };
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, scb2, sck2, sc2, ca2, rep2, failures2, active_guard);
+            handle_client(stream, ss2, sp2, pol2, reg2, psk2, rep2, failures2, active_guard);
         });
     }
 }

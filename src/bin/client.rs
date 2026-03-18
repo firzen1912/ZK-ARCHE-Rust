@@ -65,9 +65,7 @@ const MSG_AUTH_V2: u8 = 0x03;
 
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/client/device_root.bin";
 const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/client/server_pub.bin";
-const DEVICE_CERT_FILE: &str = "/var/lib/iot-auth/client/device_cert.pem";
-const DEVICE_KEY_FILE: &str = "/var/lib/iot-auth/client/device_key.pem";
-const CA_CERT_FILE: &str = "/var/lib/iot-auth/client/ca_cert.pem";
+const PROVISION_PSK_FILE: &str = "/var/lib/iot-auth/client/provision_psk.bin";
 const MAX_CERT_FILE_SIZE: usize = 128 * 1024;
 const MAX_SIG_SIZE: usize = 8192;
 
@@ -443,6 +441,20 @@ fn load_device_creds_from_root() -> std::io::Result<([u8; 32], Scalar)> {
     Ok((device_id, x))
 }
 
+fn load_provision_psk() -> std::io::Result<[u8; 32]> {
+    verify_private_file_permissions(PROVISION_PSK_FILE)?;
+    let b = fs::read(PROVISION_PSK_FILE)?;
+    if b.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "provision_psk.bin wrong length",
+        ));
+    }
+    let mut psk = [0u8; 32];
+    psk.copy_from_slice(&b);
+    Ok(psk)
+}
+
 fn creds_exist() -> bool {
     Path::new(DEVICE_ROOT_FILE).exists()
 }
@@ -628,23 +640,24 @@ fn recv_blob(stream: &mut impl Read, max_len: usize, recv: &mut usize) -> std::i
     Ok(buf)
 }
 
-fn ztp_cert_transcript_hash(
+fn ztp_psk_transcript_hash(
     device_id: &[u8; 32],
     device_pub: &[u8; 32],
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
-    device_cert: &[u8],
-    server_cert: &[u8],
+    server_pub: &[u8; 32],
+    pairing_token: Option<&[u8]>,
 ) -> [u8; 32] {
-    let dev_hash = Sha256::digest(device_cert);
-    let srv_hash = Sha256::digest(server_cert);
-    let mut t = CompatTranscript::new(b"ztp-mutual-cert-v1");
+    let mut t = CompatTranscript::new(b"ztp-psk-v1");
     t.append_message(b"device_id", device_id);
     t.append_message(b"device_pub", device_pub);
     t.append_message(b"client_nonce", client_nonce);
     t.append_message(b"server_nonce", server_nonce);
-    t.append_message(b"device_cert_hash", &dev_hash);
-    t.append_message(b"server_cert_hash", &srv_hash);
+    t.append_message(b"server_pub", server_pub);
+    match pairing_token {
+        Some(tok) => t.append_message(b"pairing_token", tok),
+        None => t.append_message(b"pairing_token", b""),
+    }
     let out = Sha256::digest(&t.buf);
     let mut th = [0u8; 32];
     th.copy_from_slice(&out);
@@ -692,41 +705,15 @@ fn do_setup(
     let mut sent = 0usize;
     let mut recv = 0usize;
 
-    verify_private_file_permissions(DEVICE_KEY_FILE)?;
-    let device_cert_buf = read_file_all(DEVICE_CERT_FILE, MAX_CERT_FILE_SIZE)?;
-    let device_key_buf = read_file_all(DEVICE_KEY_FILE, MAX_CERT_FILE_SIZE)?;
-    let ca_cert_buf = read_file_all(CA_CERT_FILE, MAX_CERT_FILE_SIZE)?;
-
-    let device_cert = load_cert_from_bytes(&device_cert_buf)?;
-    let ca_cert = load_cert_from_bytes(&ca_cert_buf)?;
-    let device_key = load_private_key_from_bytes(&device_key_buf)?;
-    verify_cert_against_ca(&device_cert, &ca_cert)?;
-
+    let mut provision_psk = load_provision_psk()?;
     let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
     reject_identity(&device_static_pub, "client device_static_pub")?;
     let device_pub_bytes = device_static_pub.compress().to_bytes();
 
-    let expected_cn = hex::encode(device_id);
-    let expected_ou = hex::encode(device_pub_bytes);
-
-    require_eku(&device_cert, EKU_TLS_CLIENT_AUTH)?;
-    require_custom_identity_extension(&device_cert, DEVICE_IDENTITY_OID, &expected_cn)?;
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::COMMONNAME)? != expected_cn {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "device certificate CN does not match device_id",
-        ));
-    }
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_ou {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "device certificate OU does not match device_pub",
-        ));
-    }
-
     let pinned_server_pub = load_server_pub()?;
     if pinned_server_pub.is_none() && !allow_tofu_setup {
         x.zeroize();
+        provision_psk.zeroize();
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "initial setup requires an out-of-band pinned server key; run --pin-server-pub first or use --allow-tofu-setup only in lab environments",
@@ -737,7 +724,7 @@ fn do_setup(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    println!("Client[SETUP/ZTP]: Connected to {}", server_addr);
+    println!("Client[SETUP/PSK]: Connected to {}", server_addr);
 
     let client_nonce = random_bytes_32();
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
@@ -758,74 +745,52 @@ fn do_setup(
     send_all(&mut stream, &device_id, &mut sent)?;
     send_all(&mut stream, &device_pub_bytes, &mut sent)?;
     send_all(&mut stream, &client_nonce, &mut sent)?;
-    send_blob(&mut stream, &device_cert_buf, &mut sent)?;
     stream.flush()?;
 
     let mut server_nonce = [0u8; 32];
     recv_exact(&mut stream, &mut server_nonce, &mut recv)?;
-    let server_cert_buf = recv_blob(&mut stream, MAX_CERT_FILE_SIZE, &mut recv)?;
-    let server_sig = recv_blob(&mut stream, MAX_SIG_SIZE, &mut recv)?;
-
-    let server_cert = load_cert_from_bytes(&server_cert_buf)?;
-    verify_cert_against_ca(&server_cert, &ca_cert)?;
-    require_eku(&server_cert, EKU_TLS_SERVER_AUTH)?;
-    let server_ou = cert_subject_field_hex(&server_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)?;
-    let server_pub_raw = hex::decode(&server_ou).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "server certificate OU is not valid hex",
-        )
-    })?;
-    if server_pub_raw.len() != 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "server certificate OU wrong length",
-        ));
-    }
-
-    require_custom_identity_extension(&server_cert, SERVER_IDENTITY_OID, &server_ou)?;
-
     let mut server_pub_bytes = [0u8; 32];
-    server_pub_bytes.copy_from_slice(&server_pub_raw);
+    recv_exact(&mut stream, &mut server_pub_bytes, &mut recv)?;
+    let mut server_tag = [0u8; 32];
+    recv_exact(&mut stream, &mut server_tag, &mut recv)?;
+
     let server_static_pub = CompressedRistretto(server_pub_bytes)
         .decompress()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "server cert OU is not a valid Ristretto pubkey",
-            )
-        })?;
-    reject_identity(&server_static_pub, "server_pub(cert)")?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server pubkey invalid"))?;
+    reject_identity(&server_static_pub, "server_pub(setup)")?;
 
     if let Some(pinned) = pinned_server_pub {
         if pinned.compress().to_bytes().ct_eq(&server_pub_bytes).unwrap_u8() == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "server cert bound pubkey mismatches pinned server_pub.bin",
+                "server setup pubkey mismatches pinned server_pub.bin",
             ));
         }
     }
 
-    let transcript_hash = ztp_cert_transcript_hash(
+    let transcript_hash = ztp_psk_transcript_hash(
         &device_id,
         &device_pub_bytes,
         &client_nonce,
         &server_nonce,
-        &device_cert_buf,
-        &server_cert_buf,
+        &server_pub_bytes,
+        pairing_token.map(|s| s.as_bytes()),
     );
 
-    let server_pubkey = server_cert
-        .public_key()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("server pubkey extract failed: {e}")))?;
-    verify_transcript_hash_sig(&server_pubkey, &transcript_hash, &server_sig)?;
+    let expected_server_tag = hmac_tag(&provision_psk, b"server setup", &transcript_hash);
+    if expected_server_tag.ct_eq(&server_tag).unwrap_u8() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server PSK tag verification failed",
+        ));
+    }
 
     let (a, s) = schnorr_prove_setup(&x, &device_id, &server_nonce);
-    let device_sig = sign_transcript_hash(&device_key, &transcript_hash)?;
+    let client_tag = hmac_tag(&provision_psk, b"client setup", &transcript_hash);
 
     send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
     send_all(&mut stream, &s.to_bytes(), &mut sent)?;
-    send_blob(&mut stream, &device_sig, &mut sent)?;
+    send_all(&mut stream, &client_tag, &mut sent)?;
     stream.flush()?;
 
     let mut ack = [0u8; 1];
@@ -839,14 +804,14 @@ fn do_setup(
 
     save_server_pub(&server_static_pub)?;
     if pinned_server_pub.is_none() {
-        println!("Client[SETUP/ZTP]: WARNING: trusted server key on first use for this enrollment.");
+        println!("Client[SETUP/PSK]: WARNING: trusted server key on first use for this enrollment.");
     }
     println!(
-        "Client[SETUP/ZTP]: Server certificate verified. Saved server_pub for AUTH_V2: {}",
+        "Client[SETUP/PSK]: Server PSK verified. Saved server_pub for AUTH_V2: {}",
         hex::encode(server_pub_bytes)
     );
     println!(
-        "Client[SETUP/ZTP]: Sent={} bytes, Received={} bytes. Enrolled with mutual cert onboarding.",
+        "Client[SETUP/PSK]: Sent={} bytes, Received={} bytes. Enrolled with per-device PSK onboarding.",
         sent, recv
     );
     println!(
@@ -854,6 +819,7 @@ fn do_setup(
         start.elapsed().as_secs_f64() * 1000.0
     );
 
+    provision_psk.zeroize();
     x.zeroize();
     Ok(())
 }

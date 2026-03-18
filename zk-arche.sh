@@ -13,9 +13,7 @@ CLIENT_BIN="${PROJECT_ROOT}/target/release/client"
 
 CLIENT_DEVICE_ROOT="${CLIENT_STATE_DIR}/device_root.bin"
 CLIENT_SERVER_PUB="${CLIENT_STATE_DIR}/server_pub.bin"
-CLIENT_DEVICE_CERT="${CLIENT_STATE_DIR}/device_cert.pem"
-CLIENT_DEVICE_KEY="${CLIENT_STATE_DIR}/device_key.pem"
-CLIENT_CA_CERT="${CLIENT_STATE_DIR}/ca_cert.pem"
+CLIENT_PROVISION_PSK="${CLIENT_STATE_DIR}/provision_psk.bin"
 
 SERVER_SK_FILE="${SERVER_STATE_DIR}/server_sk.bin"
 SERVER_PUB_HEX_FILE="${SERVER_STATE_DIR}/server_pub.hex"
@@ -23,18 +21,7 @@ SERVER_REGISTRY="${SERVER_STATE_DIR}/registry.bin"
 SERVER_REGISTRY_BAK="${SERVER_STATE_DIR}/registry.bak"
 SERVER_REPLAY_CACHE="${SERVER_STATE_DIR}/replay_cache.bin"
 
-SERVER_CERT="${SERVER_STATE_DIR}/server_cert.pem"
-SERVER_CERT_KEY="${SERVER_STATE_DIR}/server_cert_key.pem"
-SERVER_CA_CERT="${SERVER_STATE_DIR}/ca_cert.pem"
-SERVER_CA_KEY="${SERVER_STATE_DIR}/ca_key.pem"
-
-GEN_DEVICE_CERT="${GENERATED_DIR}/device_cert.pem"
-GEN_DEVICE_KEY="${GENERATED_DIR}/device_key.pem"
-
-SERVER_CSR="${GENERATED_DIR}/server.csr"
-DEVICE_CSR="${GENERATED_DIR}/device.csr"
-CA_SERIAL="${GENERATED_DIR}/ca_cert.srl"
-OPENSSL_EXT="${GENERATED_DIR}/openssl-ext.cnf"
+SERVER_PROVISION_PSK_DB="${SERVER_STATE_DIR}/provision_psk.bin"
 
 IDENT_HELPER_SRC="${GENERATED_DIR}/.zk_arche_ident_helper.c"
 IDENT_HELPER_BIN="${GENERATED_DIR}/.zk_arche_ident_helper"
@@ -334,35 +321,46 @@ generate_bound_certs() {
   log_warn "For production use, run './zk-arche.sh export-ca-key' to move it offline."
 }
 
-install_client_certs_from_generated() {
-  require_file "$GEN_DEVICE_CERT"
-  require_file "$GEN_DEVICE_KEY"
-  require_file "$SERVER_CA_CERT"
+generate_device_psk() {
+  require_cmd openssl
+  ensure_state_dirs
+  ensure_client_root
 
-  ensure_client_state_dir
-  sudo install -m 644 "$GEN_DEVICE_CERT" "$CLIENT_DEVICE_CERT"
-  sudo install -m 600 "$GEN_DEVICE_KEY" "$CLIENT_DEVICE_KEY"
-  sudo install -m 644 "$SERVER_CA_CERT" "$CLIENT_CA_CERT"
+  local derived device_id psk_hex tmp_psk tmp_db
+  derived="$(derive_client_identity_hex)"
+  device_id="$(awk '{print $1}' <<<"$derived")"
+  validate_hex32 "$device_id" "device_id"
+  psk_hex="$(openssl rand -hex 32)"
 
-  log_step "Securely removing device private key from generated dir..."
-  secure_delete "$GEN_DEVICE_KEY"
-  log_ok "Client cert material installed in $CLIENT_STATE_DIR"
-  log_ok "Device private key removed from $GENERATED_DIR"
+  tmp_psk="$(mktemp)"
+  tmp_db="$(mktemp)"
+  printf '%s' "$psk_hex" | xxd -r -p > "$tmp_psk"
+  if sudo test -f "$SERVER_PROVISION_PSK_DB"; then
+    sudo cat "$SERVER_PROVISION_PSK_DB" > "$tmp_db"
+  else
+    : > "$tmp_db"
+  fi
+  printf '%s' "$device_id" | xxd -r -p >> "$tmp_db"
+  printf '%s' "$psk_hex" | xxd -r -p >> "$tmp_db"
+
+  sudo install -m 600 "$tmp_db" "$SERVER_PROVISION_PSK_DB"
+  sudo install -m 600 "$tmp_psk" "$CLIENT_PROVISION_PSK"
+  rm -f "$tmp_psk" "$tmp_db"
+
+  log_ok "Provisioned per-device PSK for device_id=$device_id"
+  log_val "client psk file:" "$CLIENT_PROVISION_PSK"
+  log_val "server psk db:" "$SERVER_PROVISION_PSK_DB"
 }
 
 ensure_existing_server_material() {
   ensure_server_state_dir
-  require_file "$SERVER_CA_CERT"
-  require_file "$SERVER_CERT"
-  require_file "$SERVER_CERT_KEY"
+  require_file "$SERVER_PROVISION_PSK_DB"
 }
 
 ensure_existing_client_material() {
   ensure_client_state_dir
   require_file "$CLIENT_DEVICE_ROOT"
-  require_file "$CLIENT_DEVICE_CERT"
-  require_file "$CLIENT_DEVICE_KEY"
-  require_file "$CLIENT_CA_CERT"
+  require_file "$CLIENT_PROVISION_PSK"
 }
 
 ensure_existing_demo_material() {
@@ -383,12 +381,10 @@ ${_C}USAGE${_N}
 ${_C}BUILD${_N}
   build
 
-${_C}CERTIFICATE COMMANDS${_N}
-  make-certs
-  install-client-certs
-  check-server-certs
-  check-client-certs
-  export-ca-key
+${_C}PSK COMMANDS${_N}
+  make-psk
+  check-server-psk
+  check-client-psk
 
 ${_C}SERVER COMMANDS${_N}
   start-server <bind_addr> [opts]
@@ -411,7 +407,7 @@ ${_C}COMBINED FLOWS${_N}
 ${_C}RECOMMENDED LOCAL TEST FLOW${_N}
   ./zk-arche.sh build
   sudo ./zk-arche.sh reset-all
-  ./zk-arche.sh make-certs
+  ./zk-arche.sh make-psk
   sudo ./zk-arche.sh server-local 127.0.0.1:4000
   sudo ./zk-arche.sh client-local 127.0.0.1:4000
 
@@ -426,41 +422,29 @@ cmd_build() {
   log_ok "Client: $CLIENT_BIN"
 }
 
-cmd_make_certs() {
+cmd_make_psk() {
   require_bin "$SERVER_BIN"
   require_bin "$CLIENT_BIN"
-  generate_bound_certs
-  install_client_certs_from_generated
+  generate_device_psk
 
   local server_pub
   server_pub="$(derive_server_pub_hex)"
   cmd_pin_server "$server_pub"
 }
 
-cmd_install_client_certs() {
-  log_header "Installing client cert material from existing generated files"
-  require_bin "$CLIENT_BIN"
-  install_client_certs_from_generated
-}
-
-cmd_check_server_certs() {
-  log_header "Server certificate files"
-  _status_file "$SERVER_CA_CERT" "ca cert"
-  _status_file "$SERVER_CA_KEY" "ca key"
-  _status_file "$SERVER_CERT" "server cert"
-  _status_file "$SERVER_CERT_KEY" "server cert key"
+cmd_check_server_psk() {
+  log_header "Server PSK files"
+  _status_file "$SERVER_PROVISION_PSK_DB" "provision psk db"
   _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_REGISTRY" "device registry"
   _status_file "$SERVER_REPLAY_CACHE" "replay cache"
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 }
 
-cmd_check_client_certs() {
-  log_header "Client certificate files"
+cmd_check_client_psk() {
+  log_header "Client PSK files"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
-  _status_file "$CLIENT_DEVICE_CERT" "device cert"
-  _status_file "$CLIENT_DEVICE_KEY" "device key"
-  _status_file "$CLIENT_CA_CERT" "ca cert"
+  _status_file "$CLIENT_PROVISION_PSK" "provision psk"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
 }
 
@@ -530,22 +514,6 @@ cmd_pin_server() {
   log_ok "Server public key pinned"
 }
 
-cmd_export_ca_key() {
-  if ! sudo test -f "$SERVER_CA_KEY"; then
-    log_warn "CA key not found at: $SERVER_CA_KEY"
-    return
-  fi
-  log_header "CA private key export (production hardening)"
-  log_warn "Copy the key below to secure offline storage, then it will be removed from this machine."
-  echo
-  sudo cat "$SERVER_CA_KEY"
-  echo
-  log_step "Removing CA private key from server..."
-  sudo shred -u "$SERVER_CA_KEY" 2>/dev/null || sudo rm -f "$SERVER_CA_KEY"
-  log_ok "CA private key removed from $SERVER_STATE_DIR"
-  log_warn "Store the printed key securely offline. Without it you cannot issue new device certificates."
-}
-
 cmd_setup_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -ge 1 ]] || die "setup-device requires <server_ip:port>"
@@ -565,7 +533,7 @@ cmd_setup_device() {
 
   ensure_existing_client_material
 
-  log_header "Device setup (mutual certificate onboarding)"
+  log_header "Device setup (per-device PSK onboarding)"
   log_info "Server: $server_addr"
   [[ ${#extra_flags[@]} -gt 0 ]] && log_info "Extra flags: ${extra_flags[*]}"
   sudo "$CLIENT_BIN" --server "$server_addr" --setup "${extra_flags[@]}"
@@ -627,14 +595,7 @@ cmd_status() {
   _status_file "$SERVER_REGISTRY_BAK" "device registry backup"
   _status_file "$SERVER_REPLAY_CACHE" "replay cache"
   _status_file "$SERVER_SK_FILE" "server static key"
-  _status_file "$SERVER_CA_CERT" "ca cert"
-  if sudo test -f "$SERVER_CA_KEY"; then
-    log_warn "ca key: present on server (consider running 'export-ca-key' for production)"
-  else
-    log_ok "ca key: absent (offline — good)"
-  fi
-  _status_file "$SERVER_CERT" "server cert"
-  _status_file "$SERVER_CERT_KEY" "server cert key"
+  _status_file "$SERVER_PROVISION_PSK_DB" "provision psk db"
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 
   if [[ -x "$SERVER_BIN" ]]; then
@@ -645,9 +606,7 @@ cmd_status() {
 
   echo -e "\n${_W}Client state${_N}  ($CLIENT_STATE_DIR)"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
-  _status_file "$CLIENT_DEVICE_CERT" "device cert"
-  _status_file "$CLIENT_DEVICE_KEY" "device key"
-  _status_file "$CLIENT_CA_CERT" "ca cert"
+  _status_file "$CLIENT_PROVISION_PSK" "provision psk"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
 
   if sudo test -f "$CLIENT_DEVICE_ROOT"; then
@@ -665,17 +624,6 @@ cmd_status() {
     [[ -n "$hex" ]] && log_val "pinned server_pub:" "$hex"
   fi
 
-  echo -e "\n${_W}Generated files${_N}  ($GENERATED_DIR)"
-  if [[ -f "$GEN_DEVICE_CERT" ]]; then _status_file "$GEN_DEVICE_CERT" "generated device cert"; else log_ok "generated device cert: absent (cleaned up — good)"; fi
-  if [[ -f "$GEN_DEVICE_KEY" ]]; then
-    log_warn "generated device key: present (run install-client-certs to install and remove)"
-  else
-    log_ok "generated device key: absent (cleaned up — good)"
-  fi
-  if [[ -f "$SERVER_CSR" ]]; then _status_file "$SERVER_CSR" "server csr"; else log_warn "server csr: absent"; fi
-  if [[ -f "$DEVICE_CSR" ]]; then _status_file "$DEVICE_CSR" "device csr"; else log_warn "device csr: absent"; fi
-  if [[ -f "$CA_SERIAL" ]]; then _status_file "$CA_SERIAL" "ca serial"; else log_warn "ca serial: absent"; fi
-  if [[ -f "$OPENSSL_EXT" ]]; then _status_file "$OPENSSL_EXT" "openssl ext config"; else log_ok "openssl ext config: absent (cleaned up — good)"; fi
 }
 
 cmd_client_local() {
@@ -739,12 +687,8 @@ cmd_reset_server() {
              "$SERVER_SK_FILE" \
              "${SERVER_STATE_DIR}/server_pub.bin" \
              "$SERVER_PUB_HEX_FILE" \
-             "$SERVER_CERT" "$SERVER_CERT_KEY" \
-             "$SERVER_CA_CERT" "$SERVER_CA_KEY" \
-             "${SERVER_STATE_DIR}/ca_cert.srl"
-  rm -f "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY" \
-        "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" "$OPENSSL_EXT" \
-        "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN"
+             "$SERVER_PROVISION_PSK_DB"
+  rm -f "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN"
   log_ok "Server state removed"
 }
 
@@ -763,11 +707,9 @@ main() {
   local cmd="$1"; shift
   case "$cmd" in
     build) cmd_build "$@" ;;
-    make-certs) cmd_make_certs "$@" ;;
-    install-client-certs) cmd_install_client_certs "$@" ;;
-    check-server-certs) cmd_check_server_certs "$@" ;;
-    check-client-certs) cmd_check_client_certs "$@" ;;
-    export-ca-key) cmd_export_ca_key "$@" ;;
+    make-psk) cmd_make_psk "$@" ;;
+    check-server-psk) cmd_check_server_psk "$@" ;;
+    check-client-psk) cmd_check_client_psk "$@" ;;
     start-server) cmd_start_server "$@" ;;
     server-local) cmd_server_local "$@" ;;
     pin-server) cmd_pin_server "$@" ;;
