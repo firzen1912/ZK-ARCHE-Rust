@@ -390,12 +390,13 @@ Reset and rebuild demo state:
 
 ---
 
-## Summary of what changed from the old README
+# Research Notice
 
-The previous README described:
+This project is a **research prototype** for:
 
-- bootstrap ID / bootstrap secret provisioning
-- TOFU auto-pinning during bootstrap enrollment
-- commands such as `add-bootstrap`, `show-bootstrap`, and `provision-bootstrap`
+* IoT authentication protocols
+* Zero-knowledge identification systems
+* Cross-language cryptographic interoperability
+* Evaluation on constrained devices (Raspberry Pi, embedded Linux)
 
-Those descriptions do **not** match the current uploaded Rust sources or helper script. This README reflects the current implementation based on certificate generation, certificate installation, pairing-gated setup, server key pinning, and the actual `zk-arche.sh` command set.
+Not intended for production deployment without additional hardening.
