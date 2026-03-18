@@ -4,3 +4,7 @@ device_x.bin
 server_pub.bin
 server_sk.bin
 registry.bin
+bootstrap_registry.bak
+bootstrap_registry.bin
+server_pub.hex
+last_bootstrap.env
