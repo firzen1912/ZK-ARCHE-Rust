@@ -34,6 +34,7 @@ GEN_DEVICE_KEY="${GENERATED_DIR}/device_key.pem"
 SERVER_CSR="${GENERATED_DIR}/server.csr"
 DEVICE_CSR="${GENERATED_DIR}/device.csr"
 CA_SERIAL="${GENERATED_DIR}/ca_cert.srl"
+OPENSSL_EXT="${GENERATED_DIR}/openssl-ext.cnf"
 
 IDENT_HELPER_SRC="${GENERATED_DIR}/.zk_arche_ident_helper.c"
 IDENT_HELPER_BIN="${GENERATED_DIR}/.zk_arche_ident_helper"
@@ -45,84 +46,64 @@ else
   _R='' _G='' _Y='' _B='' _C='' _W='' _N=''
 fi
 
-# Prints an informational log line.
 log_info() { echo -e "${_B}[INFO]${_N}  $*"; }
-# Prints a success log line.
 log_ok() { echo -e "${_G}[OK]${_N}    $*"; }
-# Prints a warning log line.
 log_warn() { echo -e "${_Y}[WARN]${_N}  $*"; }
-# Prints an error log line to stderr.
 log_error() { echo -e "${_R}[ERROR]${_N} $*" >&2; }
-# Prints a step-progress log line.
 log_step() { echo -e "${_C}[STEP]${_N}  $*"; }
-# Prints a section header.
 log_header() { echo -e "\n${_W}==> $*${_N}"; }
-# Prints a labeled value line.
 log_val() { echo -e "    ${_Y}$1${_N}  $2"; }
-# Prints an error and exits the script.
 die() { log_error "$*"; exit 1; }
 
-# Ensures the expected binary exists and is executable.
 require_bin() {
   local bin="$1"
   [[ -x "$bin" ]] || die "Binary not found or not executable: $bin
 Build first with: ./zk-arche.sh build"
 }
 
-# Ensures the expected file exists.
 require_file() {
   local f="$1"
   sudo test -f "$f" || die "Required file not found: $f"
 }
 
-# Ensures a required external command is available.
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
 }
 
-# Validates that a value is exactly 32 bytes encoded as hex.
 validate_hex32() {
   local val="$1" label="$2"
   [[ "$val" =~ ^[0-9a-fA-F]{64}$ ]] || die "$label must be exactly 32 bytes (64 hex characters)"
 }
 
-# Installs a file to its destination with the requested mode using sudo.
 sudo_write_file() {
   local src="$1" dst="$2" mode="$3"
   sudo install -m "$mode" "$src" "$dst"
 }
 
-# Securely overwrites a file before deleting it.
-# Falls back to plain rm if shred is unavailable (macOS, etc.).
 secure_delete() {
   local path="$1"
   [[ -f "$path" ]] || return 0
   if command -v shred >/dev/null 2>&1; then
     shred -u "$path"
   else
-    # On macOS / systems without shred, overwrite with random data then remove
     dd if=/dev/urandom of="$path" bs=1 count="$(wc -c < "$path")" conv=notrunc 2>/dev/null || true
     rm -f "$path"
   fi
 }
 
-# Creates the shared state directories with secure permissions.
 ensure_state_dirs() {
   sudo mkdir -p "$BASE_STATE_DIR" "$SERVER_STATE_DIR" "$CLIENT_STATE_DIR" "$GENERATED_DIR"
   sudo chmod 700 "$BASE_STATE_DIR" "$SERVER_STATE_DIR" "$CLIENT_STATE_DIR" "$GENERATED_DIR"
 }
 
-# Ensures the client state directory tree exists.
 ensure_client_state_dir() {
   ensure_state_dirs
 }
 
-# Ensures the server state directory tree exists.
 ensure_server_state_dir() {
   ensure_state_dirs
 }
 
-# Creates the client device root secret when it is missing.
 ensure_client_root() {
   ensure_state_dirs
   if ! sudo test -f "$CLIENT_DEVICE_ROOT"; then
@@ -136,7 +117,6 @@ ensure_client_root() {
   fi
 }
 
-# Builds the helper program that derives the client identity from device_root.bin.
 build_ident_helper() {
   require_cmd gcc
   cat > "$IDENT_HELPER_SRC" <<'EOF_HELPER'
@@ -147,7 +127,6 @@ build_ident_helper() {
 #include <string.h>
 
 static void bin2hex_lower(const uint8_t *in, size_t in_len, char *out, size_t out_len) {
-    /* sodium_bin2hex already emits lowercase */
     sodium_bin2hex(out, out_len, in, in_len);
 }
 
@@ -205,14 +184,12 @@ EOF_HELPER
   gcc -O2 -std=c11 -Wall -Wextra "$IDENT_HELPER_SRC" -o "$IDENT_HELPER_BIN" -lsodium
 }
 
-# Prints the client device_id and device_pub derived from the stored root.
 derive_client_identity_hex() {
   ensure_client_root
   [[ -x "$IDENT_HELPER_BIN" ]] || build_ident_helper
   sudo "$IDENT_HELPER_BIN" "$CLIENT_DEVICE_ROOT"
 }
 
-# Prints the live server public key.
 derive_server_pub_hex() {
   require_bin "$SERVER_BIN"
   ensure_server_state_dir
@@ -222,16 +199,48 @@ derive_server_pub_hex() {
   )
 }
 
-# Generates compact Ed25519 CA, server, and device certificates bound to the derived identities.
-#
-# SECURITY WARNING — CA KEY STORAGE:
-#   This script writes ca_key.pem to SERVER_STATE_DIR for convenience.
-#   In a production deployment the CA private key must be kept OFFLINE
-#   (e.g. on an air-gapped machine or HSM).  A server compromise would
-#   otherwise allow an attacker to sign arbitrary device certificates.
-#   After running make-certs, consider running:
-#       ./zk-arche.sh export-ca-key   # prints key, then removes it from disk
-#   and storing the printed key securely offline.
+write_openssl_ext_file() {
+  local device_id="$1"
+  local device_pub="$2"
+  local server_pub="$3"
+
+  cat > "$OPENSSL_EXT" <<EOF
+[ ca_ext ]
+basicConstraints = critical, CA:true
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+
+[ server_ext ]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+1.3.6.1.4.1.55555.1.2 = ASN1:UTF8String:${server_pub}
+
+[ device_ext ]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+1.3.6.1.4.1.55555.1.1 = ASN1:UTF8String:${device_id}
+1.3.6.1.4.1.55555.1.3 = ASN1:UTF8String:${device_pub}
+EOF
+}
+
+print_cert_summary() {
+  local cert="$1" label="$2"
+  if [[ -f "$cert" ]]; then
+    log_header "$label certificate summary"
+    openssl x509 -in "$cert" -noout -subject -issuer -dates
+    echo
+    openssl x509 -in "$cert" -noout -text | grep -A 3 "X509v3 Extended Key Usage" || true
+    openssl x509 -in "$cert" -noout -text | grep -A 8 "1.3.6.1.4.1.55555" || true
+  fi
+}
+
 generate_bound_certs() {
   require_bin "$SERVER_BIN"
   require_cmd openssl
@@ -250,6 +259,8 @@ generate_bound_certs() {
   validate_hex32 "$device_pub" "device_pub"
   validate_hex32 "$server_pub" "server_pub"
 
+  write_openssl_ext_file "$device_id" "$device_pub" "$server_pub"
+
   log_header "Generating CA, server cert, and device cert"
   log_val "device_id:" "$device_id"
   log_val "device_pub:" "$device_pub"
@@ -259,14 +270,12 @@ generate_bound_certs() {
   sudo rm -f "$SERVER_CA_KEY" "$SERVER_CA_CERT" "$SERVER_CERT" "$SERVER_CERT_KEY" \
              "$SERVER_PUB_HEX_FILE" "${SERVER_STATE_DIR}/ca_cert.srl"
 
-  # Use Ed25519 for the CA and end-entity certificates to keep certs and
-  # transcript signatures compact. OpenSSL handles the digest internally for
-  # Ed25519, so do not pass -sha256 here.
   openssl genpkey -algorithm Ed25519 -out "$SERVER_CA_KEY.tmp" >/dev/null 2>&1
 
   openssl req -x509 -new -key "$SERVER_CA_KEY.tmp" \
-    -out "$SERVER_CA_CERT.tmp" -days 3650 \
-    -subj "/CN=ZK-ARCHE Demo CA" >/dev/null 2>&1
+    -out "$SERVER_CA_CERT.tmp" -days 365 \
+    -subj "/CN=ZK-ARCHE Demo CA" \
+    -extensions ca_ext -config "$OPENSSL_EXT" >/dev/null 2>&1
 
   openssl genpkey -algorithm Ed25519 -out "$SERVER_CERT_KEY.tmp" >/dev/null 2>&1
 
@@ -275,7 +284,8 @@ generate_bound_certs() {
 
   openssl x509 -req -in "$SERVER_CSR" \
     -CA "$SERVER_CA_CERT.tmp" -CAkey "$SERVER_CA_KEY.tmp" -CAcreateserial \
-    -out "$SERVER_CERT.tmp" -days 825 >/dev/null 2>&1
+    -out "$SERVER_CERT.tmp" -days 30 \
+    -extfile "$OPENSSL_EXT" -extensions server_ext >/dev/null 2>&1
 
   if [[ -f "./ca_cert.srl" ]]; then
     mv -f "./ca_cert.srl" "$CA_SERIAL"
@@ -288,7 +298,8 @@ generate_bound_certs() {
 
   openssl x509 -req -in "$DEVICE_CSR" \
     -CA "$SERVER_CA_CERT.tmp" -CAkey "$SERVER_CA_KEY.tmp" -CAcreateserial \
-    -out "$GEN_DEVICE_CERT" -days 825 >/dev/null 2>&1
+    -out "$GEN_DEVICE_CERT" -days 30 \
+    -extfile "$OPENSSL_EXT" -extensions device_ext >/dev/null 2>&1
 
   if [[ -f "./ca_cert.srl" ]]; then
     mv -f "./ca_cert.srl" "$CA_SERIAL"
@@ -302,12 +313,16 @@ generate_bound_certs() {
   sudo_write_file "$SERVER_CERT.tmp" "$SERVER_CERT" 644
   sudo_write_file "$SERVER_PUB_HEX_FILE.tmp" "$SERVER_PUB_HEX_FILE" 644
 
-  # Clean up plaintext temporaries immediately
   secure_delete "$SERVER_CA_KEY.tmp"
   rm -f "$SERVER_CA_CERT.tmp" "$SERVER_CERT_KEY.tmp" "$SERVER_CERT.tmp" "$SERVER_PUB_HEX_FILE.tmp"
 
   chmod 600 "$GEN_DEVICE_KEY" 2>/dev/null || true
   chmod 644 "$GEN_DEVICE_CERT" 2>/dev/null || true
+
+  print_cert_summary "$SERVER_CERT" "Server"
+  print_cert_summary "$GEN_DEVICE_CERT" "Device"
+
+  rm -f "$OPENSSL_EXT"
 
   log_ok "Generated matching CA/server/device certs"
   log_val "CA cert:" "$SERVER_CA_CERT"
@@ -319,7 +334,6 @@ generate_bound_certs() {
   log_warn "For production use, run './zk-arche.sh export-ca-key' to move it offline."
 }
 
-# Copies the generated client certificate material into the client state directory.
 install_client_certs_from_generated() {
   require_file "$GEN_DEVICE_CERT"
   require_file "$GEN_DEVICE_KEY"
@@ -330,15 +344,12 @@ install_client_certs_from_generated() {
   sudo install -m 600 "$GEN_DEVICE_KEY" "$CLIENT_DEVICE_KEY"
   sudo install -m 644 "$SERVER_CA_CERT" "$CLIENT_CA_CERT"
 
-  # FIX: securely delete the device private key from GENERATED_DIR after
-  # installation.  Leaving it there creates a second unprotected copy.
   log_step "Securely removing device private key from generated dir..."
   secure_delete "$GEN_DEVICE_KEY"
   log_ok "Client cert material installed in $CLIENT_STATE_DIR"
   log_ok "Device private key removed from $GENERATED_DIR"
 }
 
-# Verifies that all required server certificate files already exist.
 ensure_existing_server_material() {
   ensure_server_state_dir
   require_file "$SERVER_CA_CERT"
@@ -346,7 +357,6 @@ ensure_existing_server_material() {
   require_file "$SERVER_CERT_KEY"
 }
 
-# Verifies that all required client files already exist.
 ensure_existing_client_material() {
   ensure_client_state_dir
   require_file "$CLIENT_DEVICE_ROOT"
@@ -355,7 +365,6 @@ ensure_existing_client_material() {
   require_file "$CLIENT_CA_CERT"
 }
 
-# Verifies that all binaries and demo certificate material are present.
 ensure_existing_demo_material() {
   require_bin "$SERVER_BIN"
   require_bin "$CLIENT_BIN"
@@ -363,7 +372,6 @@ ensure_existing_demo_material() {
   ensure_existing_client_material
 }
 
-# Prints the client command-line usage help.
 usage() {
   cat <<EOF2
 
@@ -380,7 +388,7 @@ ${_C}CERTIFICATE COMMANDS${_N}
   install-client-certs
   check-server-certs
   check-client-certs
-  export-ca-key            # print CA key then remove it from disk (production hardening)
+  export-ca-key
 
 ${_C}SERVER COMMANDS${_N}
   start-server <bind_addr> [opts]
@@ -402,16 +410,14 @@ ${_C}COMBINED FLOWS${_N}
 
 ${_C}RECOMMENDED LOCAL TEST FLOW${_N}
   ./zk-arche.sh build
-  ./zk-arche.sh reset-all
+  sudo ./zk-arche.sh reset-all
   ./zk-arche.sh make-certs
-  # make-certs also pins the local server pubkey on the client
   sudo ./zk-arche.sh server-local 127.0.0.1:4000
   sudo ./zk-arche.sh client-local 127.0.0.1:4000
 
 EOF2
 }
 
-# Builds the server and client Rust binaries.
 cmd_build() {
   require_cmd cargo
   log_header "Building Rust binaries"
@@ -420,28 +426,23 @@ cmd_build() {
   log_ok "Client: $CLIENT_BIN"
 }
 
-# Generates demo certificates and installs the client certificate set.
 cmd_make_certs() {
   require_bin "$SERVER_BIN"
   require_bin "$CLIENT_BIN"
   generate_bound_certs
   install_client_certs_from_generated
 
-  # The hardened client requires an out-of-band pinned server key by default.
-  # Since this script controls local server state, pin it automatically.
   local server_pub
   server_pub="$(derive_server_pub_hex)"
   cmd_pin_server "$server_pub"
 }
 
-# Installs the previously generated client certificate files.
 cmd_install_client_certs() {
   log_header "Installing client cert material from existing generated files"
   require_bin "$CLIENT_BIN"
   install_client_certs_from_generated
 }
 
-# Reports which expected server certificate files are present.
 cmd_check_server_certs() {
   log_header "Server certificate files"
   _status_file "$SERVER_CA_CERT" "ca cert"
@@ -454,7 +455,6 @@ cmd_check_server_certs() {
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 }
 
-# Reports which expected client certificate files are present.
 cmd_check_client_certs() {
   log_header "Client certificate files"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
@@ -464,7 +464,6 @@ cmd_check_client_certs() {
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
 }
 
-# Starts the server with the provided bind address and flags.
 cmd_start_server() {
   require_bin "$SERVER_BIN"
   [[ $# -ge 1 ]] || die "start-server requires <bind_addr>"
@@ -480,7 +479,6 @@ cmd_start_server() {
   exec sudo "$SERVER_BIN" --bind "$bind_addr" "$@"
 }
 
-# Starts the server in local test mode with pairing enabled.
 cmd_server_local() {
   require_bin "$SERVER_BIN"
   [[ $# -ge 1 ]] || die "server-local requires <bind_addr>"
@@ -514,7 +512,6 @@ cmd_server_local() {
   exec sudo "$SERVER_BIN" --bind "$bind_addr" --pairing "${extra_flags[@]}"
 }
 
-# Pins the supplied server public key for the client.
 cmd_pin_server() {
   require_bin "$CLIENT_BIN"
   [[ $# -eq 1 ]] || die "pin-server requires <server_pub_hex>"
@@ -533,8 +530,6 @@ cmd_pin_server() {
   log_ok "Server public key pinned"
 }
 
-# Prints and then securely removes the CA private key from the server.
-# Use this after make-certs to move the CA key offline for production hardening.
 cmd_export_ca_key() {
   if ! sudo test -f "$SERVER_CA_KEY"; then
     log_warn "CA key not found at: $SERVER_CA_KEY"
@@ -551,7 +546,6 @@ cmd_export_ca_key() {
   log_warn "Store the printed key securely offline. Without it you cannot issue new device certificates."
 }
 
-# Runs the client setup flow against the target server.
 cmd_setup_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -ge 1 ]] || die "setup-device requires <server_ip:port>"
@@ -586,7 +580,6 @@ cmd_setup_device() {
   fi
 }
 
-# Runs the client authentication flow against the target server.
 cmd_auth_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -eq 1 ]] || die "auth-device requires <server_ip:port>"
@@ -597,7 +590,6 @@ cmd_auth_device() {
   log_ok "Authentication complete"
 }
 
-# Displays the currently pinned server public key.
 cmd_show_pinned_key() {
   if ! sudo test -f "$CLIENT_SERVER_PUB"; then
     log_warn "No pinned server key found at: $CLIENT_SERVER_PUB"
@@ -610,7 +602,6 @@ cmd_show_pinned_key() {
   log_val "Fingerprint:" "$hex"
 }
 
-# Prints whether a file exists and, when present, its size.
 _status_file() {
   local path="$1" label="$2"
   if sudo test -f "$path"; then
@@ -622,7 +613,6 @@ _status_file() {
   fi
 }
 
-# Prints a summary of the current server, client, and generated state.
 cmd_status() {
   log_header "ZK-ARCHE status (Rust version)"
   echo -e "\n${_W}Binaries${_N}"
@@ -685,9 +675,9 @@ cmd_status() {
   if [[ -f "$SERVER_CSR" ]]; then _status_file "$SERVER_CSR" "server csr"; else log_warn "server csr: absent"; fi
   if [[ -f "$DEVICE_CSR" ]]; then _status_file "$DEVICE_CSR" "device csr"; else log_warn "device csr: absent"; fi
   if [[ -f "$CA_SERIAL" ]]; then _status_file "$CA_SERIAL" "ca serial"; else log_warn "ca serial: absent"; fi
+  if [[ -f "$OPENSSL_EXT" ]]; then _status_file "$OPENSSL_EXT" "openssl ext config"; else log_ok "openssl ext config: absent (cleaned up — good)"; fi
 }
 
-# Runs the recommended local client setup and authentication test flow.
 cmd_client_local() {
   [[ $# -ge 1 ]] || die "client-local requires <server_ip:port>"
   local server_addr="$1"; shift
@@ -713,7 +703,6 @@ cmd_client_local() {
   log_ok "Setup complete"
 }
 
-# Runs the full certificate generation, install, setup, and auth onboarding sequence.
 cmd_full_device_onboard() {
   [[ $# -ge 1 ]] || die "full-device-onboard requires <server_ip:port>"
   local server_addr="$1"; shift
@@ -734,7 +723,6 @@ cmd_full_device_onboard() {
   cmd_setup_device "${setup_args[@]}"
 }
 
-# Removes client-side state files.
 cmd_reset_client() {
   log_warn "Resetting client state: $CLIENT_STATE_DIR"
   sudo rm -rf "$CLIENT_STATE_DIR"
@@ -743,7 +731,6 @@ cmd_reset_client() {
   log_ok "Client state removed"
 }
 
-# Removes server-side state files.
 cmd_reset_server() {
   log_warn "Resetting server state in: $SERVER_STATE_DIR"
   sudo rm -f "$SERVER_REGISTRY" \
@@ -756,19 +743,17 @@ cmd_reset_server() {
              "$SERVER_CA_CERT" "$SERVER_CA_KEY" \
              "${SERVER_STATE_DIR}/ca_cert.srl"
   rm -f "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY" \
-        "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" \
+        "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" "$OPENSSL_EXT" \
         "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN"
   log_ok "Server state removed"
 }
 
-# Removes both client-side and server-side state files.
 cmd_reset_all() {
   cmd_reset_server
   cmd_reset_client
   log_ok "All state removed"
 }
 
-# Parses command-line arguments and dispatches the requested program action.
 main() {
   if [[ $# -lt 1 ]]; then
     usage

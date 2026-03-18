@@ -37,6 +37,7 @@ use std::convert::TryFrom;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,17 @@ const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
 
 // [FIX-5] Each generation holds at most this many nonces before rotating
 const REPLAY_GEN_MAX: usize = 25_000;
+const REPLAY_PERSIST_EVERY_INSERTS: usize = 64;
+const REPLAY_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_ACTIVE_CONNECTIONS: usize = 128;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const FAILURE_BAN: Duration = Duration::from_secs(120);
+const MAX_FAILURES_PER_WINDOW: u32 = 8;
+const CERT_MAX_VALIDITY_DAYS: i32 = 30;
+const EKU_TLS_CLIENT_AUTH: &str = "TLS Web Client Authentication";
+const EKU_TLS_SERVER_AUTH: &str = "TLS Web Server Authentication";
+const DEVICE_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.1";
+const SERVER_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.2";
 
 // ============================================================
 // [FIX-9] NonceCounter — safe sequential nonce management
@@ -538,6 +550,7 @@ fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
     if !ok {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA"));
     }
+    enforce_short_lived_cert(cert)?;
     Ok(())
 }
 
@@ -645,6 +658,9 @@ fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
 struct ReplayCache {
     current: HashSet<[u8; 64]>,
     previous: HashSet<[u8; 64]>,
+    dirty: bool,
+    pending_inserts: usize,
+    last_persist: Option<Instant>,
 }
 
 impl ReplayCache {
@@ -677,10 +693,10 @@ impl ReplayCache {
             previous.insert(entry);
             off += 64;
         }
-        Ok(Self { current, previous })
+        Ok(Self { current, previous, dirty: false, pending_inserts: 0, last_persist: Some(Instant::now()) })
     }
 
-    fn persist(&self, path: &str) -> std::io::Result<()> {
+    fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + (self.current.len() + self.previous.len()) * 64);
         out.extend_from_slice(&(self.current.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.previous.len() as u32).to_le_bytes());
@@ -690,27 +706,42 @@ impl ReplayCache {
         for entry in &self.previous {
             out.extend_from_slice(entry);
         }
-        write_private_file_atomic(path, &out)
+        out
     }
 
-    // Returns true if the nonce is fresh (not seen before), and records it.
-    // Returns false if it is a replay.
-    fn check_and_insert(&mut self, device_id: &[u8; 32], nonce_c: &[u8; 32], persist_path: &str) -> std::io::Result<bool> {
+    fn check_and_insert(&mut self, device_id: &[u8; 32], nonce_c: &[u8; 32]) -> bool {
         let mut k = [0u8; 64];
         k[..32].copy_from_slice(device_id);
         k[32..].copy_from_slice(nonce_c);
 
         if self.current.contains(&k) || self.previous.contains(&k) {
-            return Ok(false);
+            return false;
         }
 
         if self.current.len() >= REPLAY_GEN_MAX {
             self.previous = std::mem::take(&mut self.current);
+            self.dirty = true;
         }
 
         self.current.insert(k);
-        self.persist(persist_path)?;
-        Ok(true)
+        self.dirty = true;
+        self.pending_inserts = self.pending_inserts.saturating_add(1);
+        true
+    }
+
+    fn take_persist_blob(&mut self, force: bool) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        let due = force
+            || self.pending_inserts >= REPLAY_PERSIST_EVERY_INSERTS
+            || self.last_persist.map(|t| now.duration_since(t) >= REPLAY_PERSIST_INTERVAL).unwrap_or(true);
+        if !self.dirty || !due {
+            return None;
+        }
+        let blob = self.serialize();
+        self.dirty = false;
+        self.pending_inserts = 0;
+        self.last_persist = Some(now);
+        Some(blob)
     }
 }
 
@@ -745,6 +776,131 @@ impl PairingPolicy {
     }
 }
 
+
+#[derive(Clone)]
+struct FailureState {
+    first_failure: Instant,
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+#[derive(Default)]
+struct FailureTracker {
+    peers: HashMap<String, FailureState>,
+}
+
+impl FailureTracker {
+    fn is_blocked(&mut self, peer: &str) -> bool {
+        let now = Instant::now();
+        self.peers.retain(|_, state| {
+            state.blocked_until.map(|t| t > now).unwrap_or(false) || now.duration_since(state.first_failure) <= FAILURE_WINDOW
+        });
+        match self.peers.get(peer).and_then(|s| s.blocked_until) {
+            Some(until) if until > now => true,
+            _ => false,
+        }
+    }
+
+    fn note_failure(&mut self, peer: &str) {
+        let now = Instant::now();
+        let state = self.peers.entry(peer.to_string()).or_insert(FailureState {
+            first_failure: now,
+            failures: 0,
+            blocked_until: None,
+        });
+        if now.duration_since(state.first_failure) > FAILURE_WINDOW {
+            state.first_failure = now;
+            state.failures = 0;
+            state.blocked_until = None;
+        }
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= MAX_FAILURES_PER_WINDOW {
+            state.blocked_until = Some(now + FAILURE_BAN);
+        }
+    }
+
+    fn note_success(&mut self, peer: &str) {
+        self.peers.remove(peer);
+    }
+}
+
+struct ActiveConnGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl ActiveConnGuard {
+    fn try_acquire(active: Arc<AtomicUsize>) -> Option<Self> {
+        loop {
+            let current = active.load(Ordering::Relaxed);
+            if current >= MAX_ACTIVE_CONNECTIONS {
+                return None;
+            }
+            if active
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(Self { active });
+            }
+        }
+    }
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn cert_text(cert: &X509) -> std::io::Result<String> {
+    let text = cert
+        .to_text()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text extraction failed: {e}")))?;
+    String::from_utf8(text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text utf8 failed: {e}")))
+}
+
+fn enforce_short_lived_cert(cert: &X509) -> std::io::Result<()> {
+    let diff = cert.not_after()
+        .diff(cert.not_before())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate validity diff failed: {e}")))?;
+    if diff.days > CERT_MAX_VALIDITY_DAYS || (diff.days == CERT_MAX_VALIDITY_DAYS && diff.secs > 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate validity exceeds {} days", CERT_MAX_VALIDITY_DAYS),
+        ));
+    }
+    Ok(())
+}
+
+fn require_eku(cert: &X509, required_eku: &str) -> std::io::Result<()> {
+    let text = cert_text(cert)?;
+    let has_eku_section = text.contains("Extended Key Usage");
+    if !has_eku_section || !text.contains(required_eku) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate missing required EKU: {required_eku}"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_custom_identity_extension(cert: &X509, oid: &str, expected_hex: &str) -> std::io::Result<()> {
+    let text = cert_text(cert)?;
+    let oid_pos = text.find(oid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate missing custom identity extension {oid}"),
+        )
+    })?;
+    let tail = &text[oid_pos..];
+    if !tail.to_ascii_lowercase().contains(&expected_hex.to_ascii_lowercase()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate custom identity extension {oid} mismatch"),
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================
 // Handlers
 // ============================================================
@@ -760,7 +916,13 @@ fn handle_setup(
     ca_cert: &X509,
     sent: &mut usize,
     recv: &mut usize,
+    failures: &Arc<Mutex<FailureTracker>>,
+    peer_key: &str,
 ) -> std::io::Result<()> {
+    if failures.lock().unwrap().is_blocked(peer_key) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
+    }
+
     let provided_token = recv_pairing_token(stream, recv)?;
     if !policy.allows_ztp_setup(provided_token.as_deref()) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "pairing rejected by policy"));
@@ -777,6 +939,8 @@ fn handle_setup(
 
     let expected_cn = hex::encode(device_id);
     let expected_ou = hex::encode(device_pub_bytes);
+    require_eku(&device_cert, EKU_TLS_CLIENT_AUTH)?;
+    require_custom_identity_extension(&device_cert, DEVICE_IDENTITY_OID, &expected_cn)?;
     if cert_subject_field_hex(&device_cert, openssl::nid::Nid::COMMONNAME)? != expected_cn {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate CN mismatch"));
     }
@@ -850,6 +1014,8 @@ fn handle_auth_v2(
     replay: &Arc<Mutex<ReplayCache>>,
     sent: &mut usize,
     recv: &mut usize,
+    failures: &Arc<Mutex<FailureTracker>>,
+    peer_key: &str,
 ) -> std::io::Result<()> {
     // ── 1. Anonymous ephemeral X25519 key exchange ────────────────────────────
     let mut client_pk_bytes = [0u8; 32];
@@ -920,14 +1086,22 @@ fn handle_auth_v2(
     reject_identity(&eph_c, "eph_c")?;
 
     // ── 3. Replay & Schnorr verification ─────────────────────────────────────
-    {
+    if failures.lock().unwrap().is_blocked(peer_key) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
+    }
+
+    let replay_persist_blob = {
         let mut rc = replay.lock().unwrap();
-        if !rc.check_and_insert(&device_id, &nonce_c, REPLAY_CACHE_BIN)? {
+        if !rc.check_and_insert(&device_id, &nonce_c) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "replay detected",
             ));
         }
+        rc.take_persist_blob(false)
+    };
+    if let Some(blob) = replay_persist_blob {
+        write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
     }
 
     let expected_pub = {
@@ -1019,6 +1193,10 @@ fn handle_auth_v2(
         hex::encode(device_id),
     );
 
+    if let Some(blob) = replay.lock().unwrap().take_persist_blob(true) {
+        write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
+    }
+
     session_key.zeroize();
     eph_s_secret.zeroize();
     tx_key.zeroize();
@@ -1038,11 +1216,14 @@ fn handle_client(
     server_cert: Arc<X509>,
     ca_cert: Arc<X509>,
     replay: Arc<Mutex<ReplayCache>>,
+    failures: Arc<Mutex<FailureTracker>>,
+    _active_guard: ActiveConnGuard,
 ) {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv_bytes = 0usize;
     let peer = stream.peer_addr().ok();
+    let peer_key = peer.map(|p| p.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
 
     macro_rules! bail {
         ($msg:expr) => {{
@@ -1067,11 +1248,11 @@ fn handle_client(
         MSG_SETUP => handle_setup(
             &mut stream, &policy, &server_static_pub,
             &reg, &server_cert_buf, &server_cert, &server_cert_key, &ca_cert,
-            &mut sent, &mut recv_bytes,
+            &mut sent, &mut recv_bytes, &failures, &peer_key,
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             &mut stream, &server_static_secret, &server_static_pub,
-            &reg, &replay, &mut sent, &mut recv_bytes,
+            &reg, &replay, &mut sent, &mut recv_bytes, &failures, &peer_key,
         ),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1079,8 +1260,12 @@ fn handle_client(
         )),
     };
 
-    if let Err(e) = res {
-        eprintln!("Server: request from {:?} failed: {}", peer, e);
+    match res {
+        Ok(()) => failures.lock().unwrap().note_success(&peer_key),
+        Err(e) => {
+            failures.lock().unwrap().note_failure(&peer_key);
+            eprintln!("Server: request from {:?} failed: {}", peer, e);
+        }
     }
 
     println!(
@@ -1147,6 +1332,8 @@ fn main() -> std::io::Result<()> {
     let server_cert_key = load_private_key_from_bytes(&server_key_buf)?;
     verify_cert_against_ca(&server_cert, &ca_cert)?;
     let expected_server_ou = hex::encode(server_static_pub.compress().to_bytes());
+    require_eku(&server_cert, EKU_TLS_SERVER_AUTH)?;
+    require_custom_identity_extension(&server_cert, SERVER_IDENTITY_OID, &expected_server_ou)?;
     if cert_subject_field_hex(&server_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_server_ou {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server certificate OU does not match server_pub"));
     }
@@ -1157,6 +1344,8 @@ fn main() -> std::io::Result<()> {
     let reg = Arc::new(RwLock::new(reg_map));
     let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
     let replay = Arc::new(Mutex::new(replay_state));
+    let failures = Arc::new(Mutex::new(FailureTracker::default()));
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind(&bind_addr)?;
 
     println!("C-compatible Rust Server listening on {}", bind_addr);
@@ -1186,8 +1375,15 @@ fn main() -> std::io::Result<()> {
         let sc2 = Arc::clone(&server_cert);
         let ca2 = Arc::clone(&ca_cert);
         let rep2 = Arc::clone(&replay);
+        let failures2 = Arc::clone(&failures);
+        let active2 = Arc::clone(&active_connections);
+        let Some(active_guard) = ActiveConnGuard::try_acquire(active2) else {
+            eprintln!("Server: rejecting connection because active connection limit ({}) was reached", MAX_ACTIVE_CONNECTIONS);
+            drop(stream);
+            continue;
+        };
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, scb2, sck2, sc2, ca2, rep2);
+            handle_client(stream, ss2, sp2, pol2, reg2, scb2, sck2, sc2, ca2, rep2, failures2, active_guard);
         });
     }
 }

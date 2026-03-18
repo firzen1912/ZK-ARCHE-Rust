@@ -78,6 +78,11 @@ const T_KC: &[u8] = b"kc_v1";
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
+const CERT_MAX_VALIDITY_DAYS: i32 = 30;
+const EKU_TLS_CLIENT_AUTH: &str = "TLS Web Client Authentication";
+const EKU_TLS_SERVER_AUTH: &str = "TLS Web Server Authentication";
+const DEVICE_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.1";
+const SERVER_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.2";
 
 // ============================================================
 // NonceCounter — safe sequential nonce management
@@ -497,6 +502,57 @@ fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
     if !ok {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA"));
     }
+    enforce_short_lived_cert(cert)?;
+    Ok(())
+}
+
+fn cert_text(cert: &X509) -> std::io::Result<String> {
+    let text = cert
+        .to_text()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text extraction failed: {e}")))?;
+    String::from_utf8(text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text utf8 failed: {e}")))
+}
+
+fn enforce_short_lived_cert(cert: &X509) -> std::io::Result<()> {
+    let diff = cert.not_after()
+        .diff(cert.not_before())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate validity diff failed: {e}")))?;
+    if diff.days > CERT_MAX_VALIDITY_DAYS || (diff.days == CERT_MAX_VALIDITY_DAYS && diff.secs > 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate validity exceeds {} days", CERT_MAX_VALIDITY_DAYS),
+        ));
+    }
+    Ok(())
+}
+
+fn require_eku(cert: &X509, required_eku: &str) -> std::io::Result<()> {
+    let text = cert_text(cert)?;
+    let has_eku_section = text.contains("Extended Key Usage");
+    if !has_eku_section || !text.contains(required_eku) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate missing required EKU: {required_eku}"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_custom_identity_extension(cert: &X509, oid: &str, expected_hex: &str) -> std::io::Result<()> {
+    let text = cert_text(cert)?;
+    let oid_pos = text.find(oid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate missing custom identity extension {oid}"),
+        )
+    })?;
+    let tail = &text[oid_pos..];
+    if !tail.to_ascii_lowercase().contains(&expected_hex.to_ascii_lowercase()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("certificate custom identity extension {oid} mismatch"),
+        ));
+    }
     Ok(())
 }
 
@@ -653,6 +709,8 @@ fn do_setup(
     let expected_cn = hex::encode(device_id);
     let expected_ou = hex::encode(device_pub_bytes);
 
+    require_eku(&device_cert, EKU_TLS_CLIENT_AUTH)?;
+    require_custom_identity_extension(&device_cert, DEVICE_IDENTITY_OID, &expected_cn)?;
     if cert_subject_field_hex(&device_cert, openssl::nid::Nid::COMMONNAME)? != expected_cn {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -710,6 +768,7 @@ fn do_setup(
 
     let server_cert = load_cert_from_bytes(&server_cert_buf)?;
     verify_cert_against_ca(&server_cert, &ca_cert)?;
+    require_eku(&server_cert, EKU_TLS_SERVER_AUTH)?;
     let server_ou = cert_subject_field_hex(&server_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)?;
     let server_pub_raw = hex::decode(&server_ou).map_err(|_| {
         std::io::Error::new(
@@ -723,6 +782,8 @@ fn do_setup(
             "server certificate OU wrong length",
         ));
     }
+
+    require_custom_identity_extension(&server_cert, SERVER_IDENTITY_OID, &server_ou)?;
 
     let mut server_pub_bytes = [0u8; 32];
     server_pub_bytes.copy_from_slice(&server_pub_raw);
@@ -1014,7 +1075,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 fn usage(prog: &str) {
     eprintln!(
         "Usage:
-  {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup]
+  {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup (debug-only)]
   {0} --server 127.0.0.1:4000
   {0} --pin-server-pub <hex>
   {0} --print-device-identity",
@@ -1065,6 +1126,12 @@ fn main() -> std::io::Result<()> {
                 i += 1;
             }
             "--allow-tofu-setup" => {
+                if !cfg!(debug_assertions) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "--allow-tofu-setup is disabled in production builds; pin the server key out-of-band instead",
+                    ));
+                }
                 allow_tofu_setup = true;
                 i += 1;
             }
