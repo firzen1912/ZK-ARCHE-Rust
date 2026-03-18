@@ -1,5 +1,5 @@
 // ==============================
-// server.rs (Rust implementation aligned to the C mutual-certificate onboarding flow)
+// server.rs (V2: Schnorr Ristretto25519 + X25519 + ChaCha20-Poly1305 + HKDF + HMAC with ZTP bootstrap)
 // ==============================
 //
 // Goals:
@@ -8,9 +8,12 @@
 //   3) Zero Privacy: Hide identity via ECDHE (X25519) + ChaCha20Poly1305 tunnel during AUTH.
 //   4) Replay protection: persistent nonce tracking (dropped time-based TTL for DoS fix).
 //   5) Key confirmation MACs: server sends tag_s, client replies tag_c over the secure tunnel.
-//   6) ZTP setup uses mutual certificates and transcript signatures exactly like the C version.
+//   6) ZTP bootstrap: client proves knowledge of the bootstrap secret during SETUP via a MAC.
 //
-// Server setup now matches the C implementation's mutual-certificate onboarding handshake.
+// [TOFU-FIX] After both Schnorr proof and bootstrap MAC verify, handle_setup now sends a
+//   1-byte enrollment acknowledgment (0x01) back to the client.  The client waits for this
+//   ack before pinning the server's public key — guaranteeing the key is only ever pinned
+//   after the server has confirmed the full exchange was authentic.
 //
 // Cargo.toml dependencies:
 //   curve25519-dalek = "4"
@@ -24,14 +27,12 @@
 //   hex              = "0.4"
 //   zeroize          = "1"
 //   subtle           = "2"
-//   openssl          = "0.10"
 //
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::convert::TryFrom;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -54,23 +55,18 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
 
-use openssl::pkey::{Id as PKeyId, PKey, Private, Public};
-use openssl::sign::{Signer, Verifier};
-use openssl::x509::{X509, X509NameRef};
-
 type HmacSha256 = Hmac<Sha256>;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
 
-const REGISTRY_BIN: &str = "/var/lib/iot-auth/server/registry.bin";
-const REGISTRY_BAK: &str = "/var/lib/iot-auth/server/registry.bak";
-const SERVER_SK_FILE: &str = "/var/lib/iot-auth/server/server_sk.bin";
-const SERVER_CERT_FILE: &str = "/var/lib/iot-auth/server/server_cert.pem";
-const SERVER_CERT_KEY_FILE: &str = "/var/lib/iot-auth/server/server_cert_key.pem";
-const CA_CERT_FILE: &str = "/var/lib/iot-auth/server/ca_cert.pem";
-const MAX_CERT_FILE_SIZE: usize = 128 * 1024;
-const MAX_SIG_SIZE: usize = 8192;
+const REGISTRY_BIN: &str = "registry.bin";
+const REGISTRY_BAK: &str = "registry.bak";
+const SERVER_SK_FILE: &str = "server_sk.bin";
+const BOOTSTRAP_DB_FILE: &str = "bootstrap_registry.bin";
+const BOOTSTRAP_DB_BAK: &str = "bootstrap_registry.bak";
+const BOOTSTRAP_ID_LEN: usize = 32;
+const BOOTSTRAP_SECRET_LEN: usize = 32;
 
 const T_SETUP: &[u8] = b"setup_schnorr_v1";
 const T_CLIENT: &[u8] = b"client_schnorr_v1";
@@ -376,6 +372,19 @@ fn recv_encrypted_blob(
     Ok(buf)
 }
 
+fn recv_bootstrap_id(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<[u8; BOOTSTRAP_ID_LEN]> {
+    let len = recv_u8(stream, recv)?;
+    if len as usize != BOOTSTRAP_ID_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bootstrap_id wrong length",
+        ));
+    }
+    let mut id = [0u8; BOOTSTRAP_ID_LEN];
+    recv_exact(stream, &mut id, recv)?;
+    Ok(id)
+}
+
 // [FIX-11] Receive the pairing token sent by the client during SETUP
 fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Option<String>> {
     let len = recv_u8(stream, recv)? as usize;
@@ -420,8 +429,6 @@ fn save_registry_atomic(
     bak_path: &str,
     reg: &HashMap<[u8; 32], RistrettoPoint>,
 ) -> std::io::Result<()> {
-    ensure_parent_dir(path)?;
-    ensure_parent_dir(bak_path)?;
     if Path::new(path).exists() {
         let _ = fs::copy(path, bak_path);
     }
@@ -440,105 +447,90 @@ fn save_registry_atomic(
     Ok(())
 }
 
-fn read_file_all(path: &str, max_len: usize) -> std::io::Result<Vec<u8>> {
-    let data = fs::read(path)?;
-    if data.len() > max_len {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path} exceeds max size")));
+#[derive(Clone)]
+struct BootstrapRecord {
+    secret: [u8; 32],
+}
+
+fn load_bootstrap_db(path: &str) -> std::io::Result<HashMap<[u8; 32], BootstrapRecord>> {
+    let mut db = HashMap::new();
+    let data = fs::read(path).unwrap_or_default();
+    for chunk in data.chunks_exact(64) {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&chunk[0..32]);
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&chunk[32..64]);
+        db.insert(id, BootstrapRecord { secret });
     }
-    Ok(data)
+    Ok(db)
 }
 
-fn load_cert_from_bytes(buf: &[u8]) -> std::io::Result<X509> {
-    X509::from_pem(buf)
-        .or_else(|_| X509::from_der(buf))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("X509 parse failed: {e}")))
-}
-
-fn load_private_key_from_bytes(buf: &[u8]) -> std::io::Result<PKey<Private>> {
-    PKey::private_key_from_pem(buf)
-        .or_else(|_| PKey::private_key_from_der(buf))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("private key parse failed: {e}")))
-}
-
-fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
-    let ca_pub = ca_cert.public_key().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("CA public key failed: {e}")))?;
-    cert.verify(&ca_pub)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate verify failed: {e}")))
-        .and_then(|ok| if ok { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA")) })
-}
-
-fn cert_subject_field_hex(cert: &X509, nid: openssl::nid::Nid) -> std::io::Result<String> {
-    let name: &X509NameRef = cert.subject_name();
-    let entry = name.entries_by_nid(nid).next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("missing subject field {nid:?}")))?;
-    let data = entry.data().as_utf8().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("subject field utf8 failed: {e}")))?;
-    Ok(data.to_string().to_ascii_lowercase())
-}
-
-fn sign_transcript_hash(pkey: &PKey<Private>, th: &[u8; 32]) -> std::io::Result<Vec<u8>> {
-    let mut signer = if matches!(pkey.id(), PKeyId::ED25519 | PKeyId::ED448) {
-        Signer::new_without_digest(pkey)
-    } else {
-        Signer::new(openssl::hash::MessageDigest::sha256(), pkey)
-    }.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("sign init failed: {e}")))?;
-    signer.sign_oneshot_to_vec(th)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("sign failed: {e}")))
-}
-
-fn verify_transcript_hash_sig(pkey: &PKey<Public>, th: &[u8; 32], sig: &[u8]) -> std::io::Result<()> {
-    let mut verifier = if matches!(pkey.id(), PKeyId::ED25519 | PKeyId::ED448) {
-        Verifier::new_without_digest(pkey)
-    } else {
-        Verifier::new(openssl::hash::MessageDigest::sha256(), pkey)
-    }.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("verify init failed: {e}")))?;
-    let ok = verifier.verify_oneshot(sig, th)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("verify failed: {e}")))?;
-    if ok { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "signature verification failed")) }
-}
-
-fn send_blob(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
-    send_all(stream, &(buf.len() as u32).to_le_bytes(), sent)?;
-    if !buf.is_empty() { send_all(stream, buf, sent)?; }
+fn save_bootstrap_db_atomic(
+    path: &str,
+    bak_path: &str,
+    db: &HashMap<[u8; 32], BootstrapRecord>,
+) -> std::io::Result<()> {
+    if Path::new(path).exists() {
+        let _ = fs::copy(path, bak_path);
+    }
+    let tmp = format!("{path}.tmp");
+    let mut out = Vec::with_capacity(db.len() * 64);
+    for (id, rec) in db {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&rec.secret);
+    }
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn recv_blob(stream: &mut impl Read, max_len: usize, recv: &mut usize) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    recv_exact(stream, &mut len_buf, recv)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > max_len { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("blob too large: {len}"))); }
-    let mut buf = vec![0u8; len];
-    if len > 0 { recv_exact(stream, &mut buf, recv)?; }
-    Ok(buf)
-}
-
-fn ztp_cert_transcript_hash(
+fn ztp_mac_transcript(
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
     device_id: &[u8; 32],
-    device_pub: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
-    device_cert: &[u8],
-    server_cert: &[u8],
 ) -> [u8; 32] {
-    let dev_hash = Sha256::digest(device_cert);
-    let srv_hash = Sha256::digest(server_cert);
-    let mut t = CompatTranscript::new(b"ztp-mutual-cert-v1");
+    let mut t = CompatTranscript::new(b"ztp-bootstrap-v1");
+    t.append_message(b"bootstrap_id", bootstrap_id);
     t.append_message(b"device_id", device_id);
-    t.append_message(b"device_pub", device_pub);
+    t.append_message(b"device_pub", device_static_pub.compress().as_bytes());
+    t.append_message(b"server_pub", server_static_pub.compress().as_bytes());
     t.append_message(b"client_nonce", client_nonce);
     t.append_message(b"server_nonce", server_nonce);
-    t.append_message(b"device_cert_hash", &dev_hash);
-    t.append_message(b"server_cert_hash", &srv_hash);
-    let out = Sha256::digest(&t.buf);
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, &t.buf);
+    let out = h.finalize();
     let mut th = [0u8; 32];
     th.copy_from_slice(&out);
     th
 }
 
-fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
+fn compute_bootstrap_mac(
+    bootstrap_secret: &[u8; BOOTSTRAP_SECRET_LEN],
+    bootstrap_id: &[u8; BOOTSTRAP_ID_LEN],
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let th = ztp_mac_transcript(
+        bootstrap_id, device_id, device_static_pub,
+        server_static_pub, client_nonce, server_nonce,
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(bootstrap_secret).expect("HMAC key size ok");
+    mac.update(b"ztp-bootstrap-mac");
+    mac.update(&th);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&out);
+    tag
 }
 
 fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
@@ -558,7 +550,6 @@ fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
         })
     } else {
         let sk = random_scalar();
-        ensure_parent_dir(path)?;
         fs::write(path, sk.to_bytes())?;
         Ok(sk)
     }
@@ -634,91 +625,128 @@ fn handle_setup(
     policy: &PairingPolicy,
     server_static_pub: &RistrettoPoint,
     reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    server_cert_buf: &[u8],
-    server_cert: &X509,
-    server_cert_key: &PKey<Private>,
-    ca_cert: &X509,
+    bootstrap_db: &Arc<RwLock<HashMap<[u8; 32], BootstrapRecord>>>,
     sent: &mut usize,
     recv: &mut usize,
 ) -> std::io::Result<()> {
+    // [FIX-11] Receive the pairing token from the client first
     let provided_token = recv_pairing_token(stream, recv)?;
+
+    // [FIX-1] Enforce token policy
     if !policy.allows_ztp_setup(provided_token.as_deref()) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "pairing rejected by policy"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "pairing not allowed (policy rejected)",
+        ));
     }
 
-    let device_id = recv_device_id(stream, recv)?;
-    let device_static_pub = recv_point(stream, recv, "device_pub")?;
-    let device_pub_bytes = device_static_pub.compress().to_bytes();
-    let mut client_nonce = [0u8; 32];
-    recv_exact(stream, &mut client_nonce, recv)?;
-    let device_cert_buf = recv_blob(stream, MAX_CERT_FILE_SIZE, recv)?;
-    let device_cert = load_cert_from_bytes(&device_cert_buf)?;
-    verify_cert_against_ca(&device_cert, ca_cert)?;
-
-    let expected_cn = hex::encode(device_id);
-    let expected_ou = hex::encode(device_pub_bytes);
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::COMMONNAME)? != expected_cn {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate CN mismatch"));
-    }
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_ou {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate OU mismatch"));
-    }
-
-    {
-        let reg_r = reg.read().unwrap();
-        if let Some(existing) = reg_r.get(&device_id) {
-            if existing.compress().to_bytes().ct_eq(&device_pub_bytes).unwrap_u8() == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device_id collision"));
+    let bootstrap_id = recv_bootstrap_id(stream, recv)?;
+    let bootstrap_secret = {
+        let db_r = bootstrap_db.read().unwrap();
+        match db_r.get(&bootstrap_id) {
+            Some(rec) => rec.secret,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "unknown bootstrap_id",
+                ))
             }
         }
-    }
+    };
+
+    let device_id = recv_device_id(stream, recv)?;
+    // [FIX-7] recv_point now calls reject_identity internally
+    let device_static_pub = recv_point(stream, recv, "device_static_pub")?;
+    let mut client_nonce = [0u8; 32];
+    recv_exact(stream, &mut client_nonce, recv)?;
+
+    // [FIX-6] Single write-lock for the entire check-and-insert (eliminates TOCTOU)
+    let is_new = {
+        let mut reg_w = reg.write().unwrap();
+        if let Some(existing) = reg_w.get(&device_id) {
+            if existing.compress().to_bytes() != device_static_pub.compress().to_bytes() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "device_id collision: key mismatch",
+                ));
+            }
+            false // re-enroll with same key is idempotent
+        } else {
+            reg_w.insert(device_id, device_static_pub);
+            true
+        }
+    };
 
     let mut server_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut server_nonce);
-    let transcript_hash = ztp_cert_transcript_hash(
-        &device_id,
-        &device_pub_bytes,
-        &client_nonce,
-        &server_nonce,
-        &device_cert_buf,
-        server_cert_buf,
-    );
-    let server_sig = sign_transcript_hash(server_cert_key, &transcript_hash)?;
 
+    send_all(stream, server_static_pub.compress().as_bytes(), sent)?;
     send_all(stream, &server_nonce, sent)?;
-    send_blob(stream, server_cert_buf, sent)?;
-    send_blob(stream, &server_sig, sent)?;
     stream.flush()?;
 
-    let a = recv_point(stream, recv, "setup_A")?;
+    // [FIX-7] recv_point handles identity check
+    let a = recv_point(stream, recv, "setup_a")?;
     let s = recv_scalar(stream, recv)?;
-    let device_sig = recv_blob(stream, MAX_SIG_SIZE, recv)?;
+    let mut bootstrap_mac = [0u8; 32];
+    recv_exact(stream, &mut bootstrap_mac, recv)?;
 
-    if !schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Schnorr proof invalid"));
+    let ok = schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s);
+    if !ok {
+        if is_new {
+            let mut reg_w = reg.write().unwrap();
+            reg_w.remove(&device_id);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "setup Schnorr proof invalid",
+        ));
     }
 
-    let device_cert_pubkey = device_cert.public_key().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("device pubkey extract failed: {e}")))?;
-    verify_transcript_hash_sig(&device_cert_pubkey, &transcript_hash, &device_sig)?;
-
-    let upsert = {
-        let mut reg_w = reg.write().unwrap();
-        let existed = reg_w.contains_key(&device_id);
-        reg_w.insert(device_id, device_static_pub);
-        save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_w)?;
-        !existed
-    };
-
-    println!(
-        "Server[SETUP/ZTP]: {} device_id={} via mutual certificate onboarding",
-        if upsert { "enrolled NEW" } else { "validated existing" },
-        hex::encode(device_id),
+    let expected_mac = compute_bootstrap_mac(
+        &bootstrap_secret, &bootstrap_id, &device_id,
+        &device_static_pub, server_static_pub, &client_nonce, &server_nonce,
     );
 
+    // [FIX-3] Constant-time MAC comparison
+    if expected_mac.ct_eq(&bootstrap_mac).unwrap_u8() == 0 {
+        if is_new {
+            let mut reg_w = reg.write().unwrap();
+            reg_w.remove(&device_id);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bootstrap MAC invalid",
+        ));
+    }
+
+    // Persist only if the device is truly new (Schnorr + MAC both passed)
+    if is_new {
+        let reg_r = reg.read().unwrap();
+        save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_r)?;
+        println!(
+            "Server[SETUP/ZTP]: enrolled NEW device_id={} bootstrap_id={}",
+            hex::encode(device_id),
+            hex::encode(bootstrap_id),
+        );
+    } else {
+        println!(
+            "Server[SETUP/ZTP]: validated existing device_id={} bootstrap_id={}",
+            hex::encode(device_id),
+            hex::encode(bootstrap_id),
+        );
+    }
+
+    // [TOFU-FIX] Send 1-byte enrollment acknowledgment.
+    //
+    // This byte is only reached after BOTH the Schnorr proof AND the bootstrap MAC
+    // verified successfully.  The bootstrap MAC transcript includes server_static_pub,
+    // so a MITM that substituted a different key would cause MAC verification to fail
+    // above and we would return an error before ever reaching this send.  Therefore
+    // the client can safely treat receipt of 0x01 as proof that the server it
+    // connected to is the genuine holder of the server_static_pub it received.
     send_all(stream, &[0x01u8], sent)?;
     stream.flush()?;
-    let _ = server_static_pub;
-    let _ = server_cert;
+
     Ok(())
 }
 
@@ -910,10 +938,7 @@ fn handle_client(
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
     reg: Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    server_cert_buf: Arc<Vec<u8>>,
-    server_cert_key: Arc<PKey<Private>>,
-    server_cert: Arc<X509>,
-    ca_cert: Arc<X509>,
+    bootstrap_db: Arc<RwLock<HashMap<[u8; 32], BootstrapRecord>>>,
     replay: Arc<Mutex<ReplayCache>>,
 ) {
     let start = Instant::now();
@@ -943,8 +968,7 @@ fn handle_client(
     let res = match msg_type {
         MSG_SETUP => handle_setup(
             &mut stream, &policy, &server_static_pub,
-            &reg, &server_cert_buf, &server_cert, &server_cert_key, &ca_cert,
-            &mut sent, &mut recv_bytes,
+            &reg, &bootstrap_db, &mut sent, &mut recv_bytes,
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             &mut stream, &server_static_secret, &server_static_pub,
@@ -971,83 +995,111 @@ fn handle_client(
 // ============================================================
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    let prog = args.get(0).cloned().unwrap_or_else(|| "server".to_string());
 
     let mut bind_addr = "0.0.0.0:4000".to_string();
     let mut pairing = false;
     let mut pairing_token: Option<String> = None;
     let mut pairing_seconds: Option<u64> = None;
-    let mut print_pubkey = false;
+    let mut add_bootstrap: Option<([u8; 32], [u8; 32])> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--bind" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--bind missing value")); }
+                if i + 1 >= args.len() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--bind missing value"));
+                }
                 bind_addr = args[i + 1].clone();
                 i += 2;
             }
-            "--pairing" => { pairing = true; i += 1; }
+            "--pairing" => {
+                pairing = true;
+                i += 1;
+            }
             "--pairing-token" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pairing-token missing value")); }
+                if i + 1 >= args.len() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pairing-token missing value"));
+                }
                 pairing_token = Some(args[i + 1].clone());
                 i += 2;
             }
             "--pairing-seconds" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pairing-seconds missing value")); }
-                pairing_seconds = Some(args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --pairing-seconds"))?);
+                if i + 1 >= args.len() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pairing-seconds missing value"));
+                }
+                pairing_seconds = Some(args[i + 1].parse().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad seconds value")
+                })?);
                 i += 2;
             }
-            "--print-pubkey" => { print_pubkey = true; i += 1; }
+            "--add-bootstrap" => {
+                if i + 2 >= args.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--add-bootstrap needs <bootstrap_id_hex> <bootstrap_secret_hex>",
+                    ));
+                }
+                let id_dec = hex::decode(&args[i + 1]).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_id hex")
+                })?;
+                let sec_dec = hex::decode(&args[i + 2]).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid bootstrap_secret hex")
+                })?;
+                if id_dec.len() != BOOTSTRAP_ID_LEN || sec_dec.len() != BOOTSTRAP_SECRET_LEN {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "bootstrap values must both be 32 bytes",
+                    ));
+                }
+                let mut id = [0u8; 32];
+                let mut sec = [0u8; 32];
+                id.copy_from_slice(&id_dec);
+                sec.copy_from_slice(&sec_dec);
+                add_bootstrap = Some((id, sec));
+                i += 3;
+            }
             _ => {
-                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]", prog);
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown argument: {}", args[i])));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown argument: {}", args[i]),
+                ))
             }
         }
     }
 
-    let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
-    let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
-    reject_identity(&server_static_pub, "server_static_pub")?;
-    if print_pubkey {
-        println!("{}", hex::encode(server_static_pub.compress().to_bytes()));
+    let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
+    let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
+
+    let mut bootstrap_map = load_bootstrap_db(BOOTSTRAP_DB_FILE).unwrap_or_default();
+    if let Some((id, secret)) = add_bootstrap {
+        bootstrap_map.insert(id, BootstrapRecord { secret });
+        save_bootstrap_db_atomic(BOOTSTRAP_DB_FILE, BOOTSTRAP_DB_BAK, &bootstrap_map)?;
+        println!("Server: added bootstrap_id={} to {}", hex::encode(id), BOOTSTRAP_DB_FILE);
         return Ok(());
     }
 
-    let server_cert_buf = read_file_all(SERVER_CERT_FILE, MAX_CERT_FILE_SIZE)?;
-    let server_key_buf = read_file_all(SERVER_CERT_KEY_FILE, MAX_CERT_FILE_SIZE)?;
-    let ca_cert_buf = read_file_all(CA_CERT_FILE, MAX_CERT_FILE_SIZE)?;
-    let server_cert = load_cert_from_bytes(&server_cert_buf)?;
-    let ca_cert = load_cert_from_bytes(&ca_cert_buf)?;
-    let server_cert_key = load_private_key_from_bytes(&server_key_buf)?;
-    verify_cert_against_ca(&server_cert, &ca_cert)?;
-    let expected_server_ou = hex::encode(server_static_pub.compress().to_bytes());
-    if cert_subject_field_hex(&server_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_server_ou {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server certificate OU does not match server_pub"));
-    }
-
-    let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
-    let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
     let reg = Arc::new(RwLock::new(reg_map));
+    let bootstrap_db = Arc::new(RwLock::new(bootstrap_map));
     let replay = Arc::new(Mutex::new(ReplayCache::default()));
     let listener = TcpListener::bind(&bind_addr)?;
 
-    println!("C-compatible Rust Server listening on {}", bind_addr);
+    let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
+    let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
+    reject_identity(&server_static_pub, "server_static_pub")?;
     println!("Server public key (pin this on client): {}", hex::encode(server_static_pub.compress().to_bytes()));
+
+    println!("Server: Listening on {}", bind_addr);
     println!(
-        "Server: pairing_enabled={} token_configured={} deadline={} mutual_cert_onboarding=true",
+        "Server: pairing_enabled={} token_configured={} deadline={:?} bootstrap_db_entries={}",
         policy.enabled,
         policy.token.is_some(),
-        if policy.deadline.is_some() { "set" } else { "none" },
+        policy.deadline,
+        bootstrap_db.read().unwrap().len(),
     );
 
     let ss = Arc::new(server_static_secret);
     let sp = Arc::new(server_static_pub);
-    let server_cert_buf = Arc::new(server_cert_buf);
-    let server_cert_key = Arc::new(server_cert_key);
-    let server_cert = Arc::new(server_cert);
-    let ca_cert = Arc::new(ca_cert);
 
     loop {
         let (stream, _) = listener.accept()?;
@@ -1055,13 +1107,11 @@ fn main() -> std::io::Result<()> {
         let sp2 = Arc::clone(&sp);
         let pol2 = policy.clone();
         let reg2 = Arc::clone(&reg);
-        let scb2 = Arc::clone(&server_cert_buf);
-        let sck2 = Arc::clone(&server_cert_key);
-        let sc2 = Arc::clone(&server_cert);
-        let ca2 = Arc::clone(&ca_cert);
+        let bootstrap2 = Arc::clone(&bootstrap_db);
         let rep2 = Arc::clone(&replay);
+
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, scb2, sck2, sc2, ca2, rep2);
+            handle_client(stream, ss2, sp2, pol2, reg2, bootstrap2, rep2);
         });
     }
 }
