@@ -33,7 +33,6 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::convert::TryFrom;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -442,7 +441,7 @@ fn save_registry_atomic(
     if Path::new(path).exists() {
         let _ = fs::copy(path, bak_path);
     }
-    let tmp = format!("{path}.tmp");
+    let _tmp = format!("{path}.tmp");
     let mut out = Vec::with_capacity(reg.len() * 64);
     for (id, pk) in reg {
         out.extend_from_slice(id);
