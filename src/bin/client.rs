@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::net::TcpStream;
 use std::path::Path;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake2::digest::{Update, VariableOutput};
@@ -35,6 +36,9 @@ const NONCE_LEN: usize = 32;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
+const MSG_HEARTBEAT: u8 = 0x10;
+const MSG_HEARTBEAT_ACK: u8 = 0x11;
+const MSG_GOODBYE: u8 = 0x15;
 
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/client/device_root.bin";
 const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/client/server_pub.bin";
@@ -63,6 +67,85 @@ const EKU_TLS_CLIENT_AUTH: &str = "TLS Web Client Authentication";
 const EKU_TLS_SERVER_AUTH: &str = "TLS Web Server Authentication";
 const DEVICE_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.1";
 const SERVER_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.2";
+
+const DAEMON_BASE_BACKOFF: Duration = Duration::from_secs(1);
+const DAEMON_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DEFAULT_CONTINUITY_EXPIRES_IN: u64 = 300;
+const DEFAULT_DAEMON_SUCCESS_SLEEP: Duration = Duration::from_secs(5);
+const HEARTBEAT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_MAX_AGE: Duration = Duration::from_secs(1800);
+const MAX_MISSED_HEARTBEATS: u32 = 3;
+
+#[derive(Clone, Debug)]
+struct ClientDaemonConfig {
+    enabled: bool,
+    success_sleep: Duration,
+    continuity_expires_in: u64,
+}
+
+impl Default for ClientDaemonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            success_sleep: DEFAULT_DAEMON_SUCCESS_SLEEP,
+            continuity_expires_in: DEFAULT_CONTINUITY_EXPIRES_IN,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReconnectBackoff {
+    current: Duration,
+    max: Duration,
+}
+
+impl ReconnectBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self { current: base, max }
+    }
+
+    fn reset(&mut self, base: Duration) {
+        self.current = base;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let base_ms = self.current.as_millis() as u64;
+        let jitter_ms = if base_ms == 0 { 0 } else { (OsRng.next_u32() as u64) % (base_ms / 2 + 1) };
+        let out = self.current.saturating_add(Duration::from_millis(jitter_ms));
+        self.current = std::cmp::min(self.current.saturating_mul(2), self.max);
+        out
+    }
+}
+
+
+struct ClientSession {
+    stream: TcpStream,
+    cipher_tx: ChaCha20Poly1305,
+    cipher_rx: ChaCha20Poly1305,
+    nonce_tx_ctr: NonceCounter,
+    nonce_rx_ctr: NonceCounter,
+    established_at: Instant,
+    sent: usize,
+    recv: usize,
+}
+
+impl ClientSession {
+    fn send_encrypted(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        let ct = self.cipher_tx
+            .encrypt(&self.nonce_tx_ctr.next(), payload)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "session encryption failed"))?;
+        send_blob(&mut self.stream, &ct, &mut self.sent)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn recv_encrypted(&mut self) -> std::io::Result<Vec<u8>> {
+        let ct = recv_encrypted_blob(&mut self.stream, &mut self.recv)?;
+        self.cipher_rx
+            .decrypt(&self.nonce_rx_ctr.next(), ct.as_ref())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "session decryption failed"))
+    }
+}
 
 /// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
 struct NonceCounter {
@@ -126,7 +209,6 @@ enum TranscriptValue<'a> {
     U64(u64),
     U8(u8),
     Point(&'a RistrettoPoint),
-    Scalar(&'a Scalar),
 }
 
 /// Appends a typed transcript field by serializing the value into the exact byte format expected by the protocol.
@@ -136,7 +218,6 @@ fn append_tv(t: &mut CompatTranscript, label: &[u8], v: TranscriptValue<'_>) {
         TranscriptValue::U64(n) => t.append_message(label, &n.to_le_bytes()),
         TranscriptValue::U8(n) => t.append_message(label, &[n]),
         TranscriptValue::Point(p) => t.append_message(label, p.compress().as_bytes()),
-        TranscriptValue::Scalar(s) => t.append_message(label, &s.to_bytes()),
     }
 }
 
@@ -905,7 +986,7 @@ fn do_setup(
 
 /// Runs the client-side authenticated session handshake, including the X25519 tunnel, Schnorr proof exchange, session-key derivation, and key confirmation.
 /// Step 1: require a pinned server key before attempting online authentication.
-fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
+fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar, continuity_expires_in: u64) -> std::io::Result<ClientSession> {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv = 0usize;
@@ -924,7 +1005,6 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 
     println!("Client[AUTH]: Connected to {}", server_addr);
 
-    // Step 2: create the outer X25519 tunnel used to hide the client identity during authentication.
     let client_sk = EphemeralSecret::random_from_rng(OsRng);
     let client_pk = X25519Public::from(&client_sk);
 
@@ -956,7 +1036,6 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     let mut nonce_tx_ctr = NonceCounter::new();
     let mut nonce_rx_ctr = NonceCounter::new();
 
-    // Step 3: prepare the client nonce, ephemeral Ristretto key, and client Schnorr proof bound to this session.
     let mut nonce_c = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_c);
 
@@ -975,12 +1054,9 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
         .encrypt(&nonce_tx_ctr.next(), payload1.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encryption failed"))?;
 
-    let len1 = (ct1.len() as u32).to_le_bytes();
-    send_all(&mut stream, &len1, &mut sent)?;
-    send_all(&mut stream, &ct1, &mut sent)?;
+    send_blob(&mut stream, &ct1, &mut sent)?;
     stream.flush()?;
 
-    // Step 4: receive the server response inside the encrypted tunnel and parse its proof, nonce, session material, and key-confirmation tag.
     let rx_ct = recv_encrypted_blob(&mut stream, &mut recv)?;
 
     let pt2 = cipher_rx
@@ -1009,9 +1085,7 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
 
     let server_static_pub = CompressedRistretto(s_pub_bytes)
         .decompress()
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid server_static_pub")
-        })?;
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid server_static_pub"))?;
     reject_identity(&server_static_pub, "server_static_pub")?;
 
     let a_s = CompressedRistretto(a_s_bytes)
@@ -1027,52 +1101,20 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_s"))?;
     reject_identity(&eph_s, "eph_s")?;
 
-    if pinned_server_pub
-        .compress()
-        .to_bytes()
-        .ct_eq(&server_static_pub.compress().to_bytes())
-        .unwrap_u8()
-        == 0
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Server pubkey mismatch — possible MITM",
-        ));
+    if pinned_server_pub.compress().to_bytes().ct_eq(&server_static_pub.compress().to_bytes()).unwrap_u8() == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server pubkey mismatch — possible MITM"));
     }
 
     if !schnorr_verify_server(&server_static_pub, &a_s, &s_s, &nonce_s, &eph_s) {
         eprintln!("Client[AUTH]: Server Schnorr proof FAILED");
         x.zeroize();
         eph_secret.zeroize();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "server Schnorr proof invalid",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server Schnorr proof invalid"));
     }
     println!("Client[AUTH]: Server Schnorr proof OK");
 
-    let mut session_key = derive_session_key(
-        &eph_secret,
-        &eph_s,
-        &nonce_c,
-        &nonce_s,
-        &device_id,
-        &eph_pub,
-        &eph_s,
-        &x25519_shared_bytes,
-    );
-    let th = kc_transcript_hash(
-        &device_id,
-        &a_c,
-        &s_c,
-        &nonce_c,
-        &eph_pub,
-        &server_static_pub,
-        &a_s,
-        &s_s,
-        &nonce_s,
-        &eph_s,
-    );
+    let mut session_key = derive_session_key(&eph_secret, &eph_s, &nonce_c, &nonce_s, &device_id, &eph_pub, &eph_s, &x25519_shared_bytes);
+    let th = kc_transcript_hash(&device_id, &a_c, &s_c, &nonce_c, &eph_pub, &server_static_pub, &a_s, &s_s, &nonce_s, &eph_s);
     let (k_s2c, k_c2s) = derive_kc_keys(&session_key, &th);
 
     let expected_tag_s = hmac_tag(&k_s2c, b"server finished", &th);
@@ -1080,24 +1122,40 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
     if expected_tag_s.ct_eq(&tag_s).unwrap_u8() == 0 {
         x.zeroize();
         eph_secret.zeroize();
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "server finished tag mismatch",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server finished tag mismatch"));
     }
     println!("Client[AUTH]: Key confirmation (server finished) OK");
 
-    // Step 6: send the client-side key-confirmation MAC to prove both sides derived the same authenticated session.
     let tag_c = hmac_tag(&k_c2s, b"client finished", &th);
 
     let ct3 = cipher_tx
         .encrypt(&nonce_tx_ctr.next(), tag_c.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encryption failed"))?;
 
-    let len3 = (ct3.len() as u32).to_le_bytes();
-    send_all(&mut stream, &len3, &mut sent)?;
-    send_all(&mut stream, &ct3, &mut sent)?;
+    send_blob(&mut stream, &ct3, &mut sent)?;
     stream.flush()?;
+
+    println!("Client[CONT]: preparing pending continuity state");
+    let (client_continuity_proof, pending_client_state) = prepare_client_continuity_proof(device_id, &x, continuity_expires_in)?;
+    let client_continuity_blob = client_continuity_proof.serialize();
+    println!("Client[CONT]: sending client continuity proof");
+    let ct4 = cipher_tx
+        .encrypt(&nonce_tx_ctr.next(), client_continuity_blob.as_ref())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "continuity proof encryption failed"))?;
+    send_blob(&mut stream, &ct4, &mut sent)?;
+    stream.flush()?;
+
+    let rx_ct3 = recv_encrypted_blob(&mut stream, &mut recv)?;
+    let server_continuity_plain = cipher_rx
+        .decrypt(&nonce_rx_ctr.next(), rx_ct3.as_ref())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed on server continuity proof"))?;
+    let server_continuity_proof = ContinuityProof::deserialize(&server_continuity_plain)?;
+    let verified_server_track = verify_server_continuity_proof(&server_continuity_proof, false)?;
+    println!("Client[CONT]: server continuity proof verified");
+
+    save_client_continuity_state(&pending_client_state)?;
+    save_server_track(&verified_server_track)?;
+    println!("Client[CONT]: committing continuity state");
 
     println!("Client[AUTH]: Sent encrypted client finished tag");
 
@@ -1114,8 +1172,63 @@ fn do_auth_v2(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io:
         sent,
         recv
     );
+
+    Ok(ClientSession {
+        stream,
+        cipher_tx,
+        cipher_rx,
+        nonce_tx_ctr,
+        nonce_rx_ctr,
+        established_at: Instant::now(),
+        sent,
+        recv,
+    })
+}
+
+fn do_auth_v2(server_addr: &str, device_id: [u8; 32], x: Scalar, continuity_expires_in: u64) -> std::io::Result<()> {
+    let mut sess = do_auth_v2_session(server_addr, device_id, x, continuity_expires_in)?;
+    let goodbye = [MSG_GOODBYE];
+    let _ = sess.send_encrypted(&goodbye);
     Ok(())
 }
+
+fn run_online_session(mut session: ClientSession, heartbeat_interval: Duration) -> std::io::Result<()> {
+    let mut missed_heartbeats = 0u32;
+    println!("Client[ONLINE]: session established");
+    loop {
+        if session.established_at.elapsed() >= SESSION_MAX_AGE {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "session expired"));
+        }
+
+        let hb = [MSG_HEARTBEAT];
+        session.send_encrypted(&hb)?;
+        println!("Client[HB]: sent");
+        session.stream.set_read_timeout(Some(HEARTBEAT_ACK_TIMEOUT))?;
+        match session.recv_encrypted() {
+            Ok(msg) => {
+                if msg.len() == 1 && msg[0] == MSG_HEARTBEAT_ACK {
+                    println!("Client[HB]: ack");
+                    missed_heartbeats = 0;
+                } else if msg.len() == 1 && msg[0] == MSG_GOODBYE {
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "server closed session"));
+                } else {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected online message"));
+                }
+            }
+            Err(e) => {
+                missed_heartbeats = missed_heartbeats.saturating_add(1);
+                eprintln!("Client[HB]: missed {} ({})", missed_heartbeats, e);
+                if missed_heartbeats >= MAX_MISSED_HEARTBEATS {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "heartbeat failure"));
+                }
+                continue;
+            }
+        }
+        session.stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        thread::sleep(heartbeat_interval);
+    }
+}
+
 
 
 
@@ -1402,51 +1515,57 @@ fn save_server_track(st: &ContinuityState) -> std::io::Result<()> {
     write_private_file_atomic(SERVER_CONTINUITY_TRACK_FILE, &st.serialize())
 }
 
-/// Builds a client continuity proof and advances the local continuity state.
-fn build_client_continuity_proof(device_id: [u8; 32], x: &Scalar, expires_in: u64) -> std::io::Result<(ContinuityProof, ContinuityState)> {
+/// Builds a candidate client continuity proof without persisting the new local state yet.
+fn prepare_client_continuity_proof(device_id: [u8; 32], x: &Scalar, expires_in: u64) -> std::io::Result<(ContinuityProof, ContinuityState)> {
     if expires_in == 0 || expires_in > 300 {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in must be between 1 and 300"));
     }
     let pinned_server_pub = load_server_pub()?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no pinned server pub for continuity"))?;
-    let mut st = load_or_init_client_continuity_state(&device_id, x, &pinned_server_pub)?;
-    st.continuity_counter = st.continuity_counter.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity counter exhausted"))?;
-    st.reconnect_epoch = st.reconnect_epoch.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "reconnect epoch exhausted"))?;
-    st.state_hash = hash_client_continuity_state(&st.identity, &st.pubkey, pinned_server_pub.compress().as_bytes(), st.continuity_counter, st.reconnect_epoch);
+    let current = load_or_init_client_continuity_state(&device_id, x, &pinned_server_pub)?;
+    let mut pending = current.clone();
+    pending.continuity_counter = pending.continuity_counter.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity counter exhausted"))?;
+    pending.reconnect_epoch = pending.reconnect_epoch.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "reconnect epoch exhausted"))?;
+    pending.state_hash = hash_client_continuity_state(&pending.identity, &pending.pubkey, pinned_server_pub.compress().as_bytes(), pending.continuity_counter, pending.reconnect_epoch);
 
     let pubkey_point = RISTRETTO_BASEPOINT_POINT * x;
-    let checkpoint_hash = next_checkpoint_hash(&st.last_checkpoint_hash, &st.state_hash, st.continuity_counter, st.reconnect_epoch, &st.last_peer_id);
+    let checkpoint_hash = next_checkpoint_hash(&current.last_checkpoint_hash, &pending.state_hash, pending.continuity_counter, pending.reconnect_epoch, &pending.last_peer_id);
     let issued_at = unix_time_now()?;
     let expires_at = issued_at.checked_add(expires_in).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "expires_at overflow"))?;
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
-    let c = continuity_challenge_scalar(T_CLIENT_CONT, st.role, &st.identity, &pubkey_point, &st.last_peer_id, issued_at, expires_at, st.continuity_counter, st.reconnect_epoch, &st.last_checkpoint_hash, &st.state_hash, &checkpoint_hash, &a);
+    let c = continuity_challenge_scalar(T_CLIENT_CONT, pending.role, &pending.identity, &pubkey_point, &pending.last_peer_id, issued_at, expires_at, pending.continuity_counter, pending.reconnect_epoch, &current.last_checkpoint_hash, &pending.state_hash, &checkpoint_hash, &a);
     let s = r + c * x;
     let proof = ContinuityProof {
         version: 1,
-        role: st.role,
-        identity: st.identity,
-        pubkey: st.pubkey,
-        peer_id: st.last_peer_id,
+        role: pending.role,
+        identity: pending.identity,
+        pubkey: pending.pubkey,
+        peer_id: pending.last_peer_id,
         issued_at,
         expires_at,
-        continuity_counter: st.continuity_counter,
-        reconnect_epoch: st.reconnect_epoch,
-        prev_checkpoint_hash: st.last_checkpoint_hash,
-        state_hash: st.state_hash,
+        continuity_counter: pending.continuity_counter,
+        reconnect_epoch: pending.reconnect_epoch,
+        prev_checkpoint_hash: current.last_checkpoint_hash,
+        state_hash: pending.state_hash,
         checkpoint_hash,
         a: a.compress().to_bytes(),
         s: s.to_bytes(),
     };
-    st.last_checkpoint_hash = checkpoint_hash;
-    save_client_continuity_state(&st)?;
-    Ok((proof, st))
+    pending.last_checkpoint_hash = checkpoint_hash;
+    Ok((proof, pending))
 }
 
-/// Parses and verifies a server continuity proof file using the pinned server identity.
-fn verify_server_continuity_proof_from_file(path: &str) -> std::io::Result<()> {
+/// Builds a client continuity proof and persists the new local state.
+fn build_client_continuity_proof(device_id: [u8; 32], x: &Scalar, expires_in: u64) -> std::io::Result<(ContinuityProof, ContinuityState)> {
+    let (proof, pending) = prepare_client_continuity_proof(device_id, x, expires_in)?;
+    save_client_continuity_state(&pending)?;
+    Ok((proof, pending))
+}
+
+/// Verifies a server continuity proof and optionally persists the updated tracked state.
+fn verify_server_continuity_proof(proof: &ContinuityProof, persist: bool) -> std::io::Result<ContinuityState> {
     let pinned_server_pub = load_server_pub()?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no pinned server pub for continuity verification"))?;
     let expected_identity = server_peer_id_from_pinned_pub(&pinned_server_pub);
-    let proof = ContinuityProof::deserialize(&fs::read(path)?)?;
     if proof.role != 2 {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "proof is not a server continuity proof"));
     }
@@ -1490,8 +1609,17 @@ fn verify_server_continuity_proof_from_file(path: &str) -> std::io::Result<()> {
     track.reconnect_epoch = proof.reconnect_epoch;
     track.last_checkpoint_hash = proof.checkpoint_hash;
     track.state_hash = hash_server_track_state(&proof.peer_id, track.continuity_counter, track.reconnect_epoch, &track.last_checkpoint_hash);
-    save_server_track(&track)?;
-    println!("Client[CONTINUITY]: verified returning server continuity proof file={} counter={} reconnect_epoch={}", path, proof.continuity_counter, proof.reconnect_epoch);
+    if persist {
+        save_server_track(&track)?;
+    }
+    Ok(track)
+}
+
+/// Parses and verifies a server continuity proof file using the pinned server identity.
+fn verify_server_continuity_proof_from_file(path: &str) -> std::io::Result<()> {
+    let proof = ContinuityProof::deserialize(&fs::read(path)?)?;
+    let track = verify_server_continuity_proof(&proof, true)?;
+    println!("Client[CONTINUITY]: verified returning server continuity proof file={} counter={} reconnect_epoch={}", path, track.continuity_counter, track.reconnect_epoch);
     Ok(())
 }
 
@@ -1687,6 +1815,7 @@ fn usage(prog: &str) {
         "Usage:
   {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup (debug-only)]
   {0} --server 127.0.0.1:4000
+  {0} --server 127.0.0.1:4000 --daemon [--daemon-interval-secs N] [--continuity-expires-in <1..300>]
   {0} --pin-server-pub <hex>
   {0} --print-device-identity
   {0} --make-offline-proof <file> --audience <name> --scope <scope> [--offline-expires-in <1..300>] [--request-hash <hex>|--request-file <path>]
@@ -1696,21 +1825,35 @@ fn usage(prog: &str) {
     );
 }
 
-/// Prints the derived device identifier and static public key for enrollment or debugging.
 fn print_device_identity() -> std::io::Result<()> {
-    // Step 2: load the deterministic device identity and static secret derived from the local root secret.
     let (device_id, x) = load_device_creds_from_root()?;
     let device_pub = RISTRETTO_BASEPOINT_POINT * x;
-    println!(
-        "{} {}",
-        hex::encode(device_id),
-        hex::encode(device_pub.compress().to_bytes())
-    );
+    println!("{} {}", hex::encode(device_id), hex::encode(device_pub.compress().to_bytes()));
     Ok(())
 }
 
-/// Parses CLI arguments, loads local credentials, and dispatches to setup, live authentication, offline proof, or continuity operations.
-/// Step 1: parse command-line flags and collect the requested operation.
+fn run_client_daemon(server_addr: &str, device_id: [u8; 32], heartbeat_interval: Duration, continuity_expires_in: u64) -> std::io::Result<()> {
+    let mut backoff = ReconnectBackoff::new(DAEMON_BASE_BACKOFF, DAEMON_MAX_BACKOFF);
+    loop {
+        let (_, x) = load_device_creds_from_root()?;
+        match do_auth_v2_session(server_addr, device_id, x, continuity_expires_in) {
+            Ok(session) => {
+                backoff.reset(DAEMON_BASE_BACKOFF);
+                match run_online_session(session, heartbeat_interval) {
+                    Ok(()) => eprintln!("Client[DAEMON]: session closed cleanly"),
+                    Err(e) => eprintln!("Client[DAEMON]: session lost: {}", e),
+                }
+            }
+            Err(e) => {
+                eprintln!("Client[DAEMON]: connect/auth failed: {}", e);
+            }
+        }
+        let delay = backoff.next_delay();
+        eprintln!("Client[DAEMON]: reconnecting after {:?}", delay);
+        thread::sleep(delay);
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let prog = args.get(0).cloned().unwrap_or_else(|| "client".to_string());
@@ -1726,168 +1869,91 @@ fn main() -> std::io::Result<()> {
     let mut offline_request_hash: Option<[u8; 32]> = None;
     let mut continuity_output: Option<String> = None;
     let mut verify_server_continuity_path: Option<String> = None;
-    let mut continuity_expires_in: u64 = 300;
+    let mut continuity_expires_in: u64 = DEFAULT_CONTINUITY_EXPIRES_IN;
+    let mut daemon_cfg = ClientDaemonConfig::default();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--server" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--server missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--server missing value")); }
                 server_addr = args[i + 1].clone();
                 i += 2;
             }
-            "--setup" => {
-                do_setup_flag = true;
-                i += 1;
+            "--setup" => { do_setup_flag = true; i += 1; }
+            "--daemon" => { daemon_cfg.enabled = true; i += 1; }
+            "--daemon-interval-secs" => {
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--daemon-interval-secs missing value")); }
+                let secs: u64 = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --daemon-interval-secs"))?;
+                daemon_cfg.success_sleep = Duration::from_secs(secs.max(1));
+                i += 2;
             }
-            "--print-device-identity" => {
-                print_identity = true;
-                i += 1;
-            }
+            "--print-device-identity" => { print_identity = true; i += 1; }
             "--allow-tofu-setup" => {
                 if !cfg!(debug_assertions) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "--allow-tofu-setup is disabled in production builds; pin the server key out-of-band instead",
-                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "--allow-tofu-setup is disabled in production builds; pin the server key out-of-band instead"));
                 }
                 allow_tofu_setup = true;
                 i += 1;
             }
             "--pairing-token" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--pairing-token missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pairing-token missing value")); }
                 pairing_token = Some(args[i + 1].clone());
                 i += 2;
             }
             "--make-offline-proof" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--make-offline-proof missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof missing value")); }
                 offline_output = Some(args[i + 1].clone());
                 i += 2;
             }
             "--make-client-continuity-proof" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-client-continuity-proof missing value"));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-client-continuity-proof missing value")); }
                 continuity_output = Some(args[i + 1].clone());
                 i += 2;
             }
             "--verify-server-continuity-proof" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-server-continuity-proof missing value"));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-server-continuity-proof missing value")); }
                 verify_server_continuity_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "--audience" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--audience missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--audience missing value")); }
                 offline_audience = Some(args[i + 1].clone());
                 i += 2;
             }
             "--scope" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--scope missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--scope missing value")); }
                 offline_scope = Some(args[i + 1].clone());
                 i += 2;
             }
             "--offline-expires-in" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--offline-expires-in missing value",
-                    ));
-                }
-                offline_expires_in = args[i + 1].parse().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --offline-expires-in")
-                })?;
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--offline-expires-in missing value")); }
+                offline_expires_in = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --offline-expires-in"))?;
                 i += 2;
             }
             "--continuity-expires-in" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in missing value"));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in missing value")); }
                 continuity_expires_in = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --continuity-expires-in"))?;
+                daemon_cfg.continuity_expires_in = continuity_expires_in;
                 i += 2;
             }
             "--request-hash" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--request-hash missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--request-hash missing value")); }
                 offline_request_hash = Some(parse_hash32_hex(&args[i + 1])?);
                 i += 2;
             }
             "--request-file" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--request-file missing value",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--request-file missing value")); }
                 offline_request_hash = Some(sha256_file(&args[i + 1])?);
                 i += 2;
             }
             "--pin-server-pub" => {
-                if i + 1 >= args.len() {
-                    usage(&prog);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "--pin-server-pub missing value",
-                    ));
-                }
-                let decoded = hex::decode(&args[i + 1]).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex for pinned key")
-                })?;
-                if decoded.len() != 32 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "pinned key must be 32 bytes",
-                    ));
-                }
+                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--pin-server-pub missing value")); }
+                let decoded = hex::decode(&args[i + 1]).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex for pinned key"))?;
+                if decoded.len() != 32 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "pinned key must be 32 bytes")); }
                 let mut key_bytes = [0u8; 32];
                 key_bytes.copy_from_slice(&decoded);
-                let p = CompressedRistretto(key_bytes).decompress().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "pinned key is not a valid Ristretto point",
-                    )
-                })?;
+                let p = CompressedRistretto(key_bytes).decompress().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pinned key is not a valid Ristretto point"))?;
                 reject_identity(&p, "pinned server pub")?;
                 save_server_pub(&p)?;
                 println!("Client: Successfully pinned server pubkey out-of-band.");
@@ -1895,34 +1961,18 @@ fn main() -> std::io::Result<()> {
             }
             _ => {
                 usage(&prog);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("unknown argument: {}", args[i]),
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown argument: {}", args[i])));
             }
         }
     }
 
-    // Step 3: handle utility modes before opening a network session.
-    if print_identity {
-        return print_device_identity();
-    }
+    if print_identity { return print_device_identity(); }
+    if let Some(path) = verify_server_continuity_path.as_deref() { return verify_server_continuity_proof_from_file(path); }
 
-    if let Some(path) = verify_server_continuity_path.as_deref() {
-        return verify_server_continuity_proof_from_file(path);
-    }
-
-    // Step 4: dispatch to offline-proof or continuity-proof workflows when requested.
     if let Some(output_path) = offline_output.as_deref() {
-        let audience = offline_audience.as_deref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --audience")
-        })?;
-        let scope = offline_scope.as_deref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --scope")
-        })?;
-        let request_hash = offline_request_hash.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --request-hash or --request-file")
-        })?;
+        let audience = offline_audience.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --audience"))?;
+        let scope = offline_scope.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --scope"))?;
+        let request_hash = offline_request_hash.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --request-hash or --request-file"))?;
         let (device_id, x) = load_device_creds_from_root()?;
         return do_make_offline_proof(output_path, device_id, x, audience, scope, offline_expires_in, request_hash);
     }
@@ -1936,28 +1986,19 @@ fn main() -> std::io::Result<()> {
     if Path::new(SERVER_PUB_FILE).exists() { verify_private_file_permissions(SERVER_PUB_FILE)?; }
 
     if !creds_exist() && !do_setup_flag {
-        eprintln!(
-            "Client: device root missing ({}). Run --setup to enroll.",
-            DEVICE_ROOT_FILE
-        );
+        eprintln!("Client: device root missing ({}). Run --setup to enroll.", DEVICE_ROOT_FILE);
         return Ok(());
     }
 
     let had_root_before = creds_exist();
     let (device_id, x) = load_device_creds_from_root()?;
 
-    // Step 5: otherwise choose between setup and live online authentication.
     if do_setup_flag {
-        println!(
-            "Client[SETUP/ZTP]: {}",
-            if had_root_before {
-                "Using existing device root for setup (idempotent)."
-            } else {
-                "No device root found; generating NEW device root."
-            }
-        );
+        println!("Client[SETUP/ZTP]: {}", if had_root_before { "Using existing device root for setup (idempotent)." } else { "No device root found; generating NEW device root." });
         do_setup(&server_addr, device_id, x, pairing_token.as_deref(), allow_tofu_setup)
+    } else if daemon_cfg.enabled {
+        run_client_daemon(&server_addr, device_id, daemon_cfg.success_sleep, daemon_cfg.continuity_expires_in)
     } else {
-        do_auth_v2(&server_addr, device_id, x)
+        do_auth_v2(&server_addr, device_id, x, continuity_expires_in)
     }
 }
