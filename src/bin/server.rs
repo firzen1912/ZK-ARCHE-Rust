@@ -1,32 +1,3 @@
-// ==============================
-// server.rs (Rust implementation aligned to the C mutual-certificate onboarding flow)
-// ==============================
-//
-// Goals:
-//   1) Let clients learn/pin server identity during SETUP by sending server_static_pub.
-//   2) Mutual auth: server proves possession of its static secret during AUTH.
-//   3) Zero Privacy: Hide identity via ECDHE (X25519) + ChaCha20Poly1305 tunnel during AUTH.
-//   4) Replay protection: persistent nonce tracking (dropped time-based TTL for DoS fix).
-//   5) Key confirmation MACs: server sends tag_s, client replies tag_c over the secure tunnel.
-//   6) ZTP setup uses mutual certificates and transcript signatures exactly like the C version.
-//
-// Server setup now matches the C implementation's mutual-certificate onboarding handshake.
-//
-// Cargo.toml dependencies:
-//   curve25519-dalek = "4"
-//   x25519-dalek     = { version = "2.0", features = ["static_secrets"] }
-//   chacha20poly1305 = "0.10"
-//   blake2           = "0.10"
-//   rand             = "0.8"
-//   sha2             = "0.10"
-//   hkdf             = "0.12"
-//   hmac             = "0.12"
-//   hex              = "0.4"
-//   zeroize          = "1"
-//   subtle           = "2"
-//   openssl          = "0.10"
-//
-
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -90,16 +61,13 @@ const T_SERVER_CONT: &[u8] = b"server_continuity_v1";
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-// [FIX-4] Hard cap on incoming encrypted payload size (~4 KiB is generous for this protocol)
 const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
 
-// [FIX-5] Each generation holds at most this many nonces before rotating
 const REPLAY_GEN_MAX: usize = 25_000;
 const REPLAY_PERSIST_EVERY_INSERTS: usize = 64;
 const REPLAY_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_ACTIVE_CONNECTIONS: usize = 128;
 const MAX_OFFLINE_FIELD: usize = 256;
-//const MAX_CONTINUITY_FIELD: usize = 256;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_BAN: Duration = Duration::from_secs(120);
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
@@ -109,20 +77,17 @@ const EKU_TLS_SERVER_AUTH: &str = "TLS Web Server Authentication";
 const DEVICE_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.1";
 const SERVER_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.2";
 
-// ============================================================
-// [FIX-9] NonceCounter — safe sequential nonce management
-// ============================================================
+/// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
 struct NonceCounter {
     value: u64,
 }
 
+/// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
 impl NonceCounter {
     fn new() -> Self {
         Self { value: 0 }
     }
 
-    // Returns a fresh 12-byte nonce and advances the counter.
-    // Panics only on u64 overflow (2^64 messages — not reachable in practice).
     fn next(&mut self) -> Nonce {
         let n = self.value;
         self.value = self.value.checked_add(1).expect("nonce counter exhausted");
@@ -132,13 +97,12 @@ impl NonceCounter {
     }
 }
 
-// ============================================================
-// C-compatible transcript
-// ============================================================
+/// Builds a deterministic, C-compatible transcript buffer that is later hashed into protocol challenges.
 struct CompatTranscript {
     buf: Vec<u8>,
 }
 
+/// Builds a deterministic, C-compatible transcript buffer that is later hashed into protocol challenges.
 impl CompatTranscript {
     fn new(domain: &[u8]) -> Self {
         assert!(domain.len() <= 255, "domain too long");
@@ -169,6 +133,7 @@ impl CompatTranscript {
 
 
 #[derive(Clone, Copy)]
+/// Wraps the supported value types that can be appended into a compatibility transcript.
 enum TranscriptValue<'a> {
     Bytes(&'a [u8]),
     U64(u64),
@@ -177,6 +142,7 @@ enum TranscriptValue<'a> {
     Scalar(&'a Scalar),
 }
 
+/// Appends a typed transcript field by serializing the value into the exact byte format expected by the protocol.
 fn append_tv(t: &mut CompatTranscript, label: &[u8], v: TranscriptValue<'_>) {
     match v {
         TranscriptValue::Bytes(b) => t.append_message(label, b),
@@ -187,6 +153,7 @@ fn append_tv(t: &mut CompatTranscript, label: &[u8], v: TranscriptValue<'_>) {
     }
 }
 
+/// Constructs a transcript from a domain separator and an ordered list of labeled fields.
 fn build_transcript(domain: &[u8], fields: &[(&[u8], TranscriptValue<'_>)]) -> CompatTranscript {
     let mut t = CompatTranscript::new(domain);
     for (label, value) in fields {
@@ -195,26 +162,26 @@ fn build_transcript(domain: &[u8], fields: &[(&[u8], TranscriptValue<'_>)]) -> C
     t
 }
 
+/// Builds a transcript and derives the Schnorr challenge scalar from its hash.
 fn transcript_challenge_scalar(domain: &[u8], fields: &[(&[u8], TranscriptValue<'_>)]) -> Scalar {
     build_transcript(domain, fields).challenge_scalar()
 }
 
-// ============================================================
-// Crypto helpers
-// ============================================================
+/// Generates a uniformly random Ristretto scalar for ephemeral proofs or keys.
 fn random_scalar() -> Scalar {
     let mut bytes = [0u8; 64];
     OsRng.fill_bytes(&mut bytes);
     Scalar::from_bytes_mod_order_wide(&bytes)
 }
 
+/// Generates 32 cryptographically secure random bytes.
 fn random_bytes_32() -> [u8; 32] {
     let mut b = [0u8; 32];
     OsRng.fill_bytes(&mut b);
     b
 }
 
-// [FIX-7] Reject identity (low-order / neutral) points on all adversary inputs
+/// Rejects the neutral Ristretto point so invalid or low-order inputs are not accepted.
 fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     if *p == RistrettoPoint::default() {
         return Err(std::io::Error::new(
@@ -225,9 +192,7 @@ fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// ============================================================
-// Schnorr proofs
-// ============================================================
+/// Verifies the client setup proof against the presented device public key and server nonce.
 fn schnorr_verify_setup(
     pubkey: &RistrettoPoint,
     device_id: &[u8; 32],
@@ -247,6 +212,7 @@ fn schnorr_verify_setup(
     RISTRETTO_BASEPOINT_POINT * s == a + pubkey * c
 }
 
+/// Verifies the client online-authentication Schnorr proof against the registered device key.
 fn schnorr_verify_auth(
     expected_pubkey: &RistrettoPoint,
     device_id: &[u8; 32],
@@ -268,6 +234,7 @@ fn schnorr_verify_auth(
     RISTRETTO_BASEPOINT_POINT * s == a + expected_pubkey * c
 }
 
+/// Creates the server Schnorr proof that demonstrates possession of the pinned static secret.
 fn schnorr_prove_server(
     server_secret: &Scalar,
     nonce_s: &[u8; 32],
@@ -289,10 +256,7 @@ fn schnorr_prove_server(
     (a, s)
 }
 
-// ============================================================
-// Session key derivation
-// [FIX-8] x25519_shared is mixed in so the outer tunnel binds to the session key
-// ============================================================
+/// Derives the shared session key from the Ristretto ECDHE secret, handshake nonces, identities, and X25519 tunnel binding.
 fn derive_session_key(
     eph_secret: &Scalar,
     peer_eph_pub: &RistrettoPoint,
@@ -323,9 +287,7 @@ fn derive_session_key(
     okm
 }
 
-// ============================================================
-// Key confirmation (KC)
-// ============================================================
+/// Hashes the full key-confirmation transcript so both peers MAC the exact same authenticated session state.
 fn kc_transcript_hash(
     device_id: &[u8; 32],
     a_c: &RistrettoPoint,
@@ -358,6 +320,7 @@ fn kc_transcript_hash(
     r
 }
 
+/// Derives directional key-confirmation MAC keys from the session key and transcript hash.
 fn derive_kc_keys(session_key: &[u8; 32], th: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let hk = Hkdf::<Sha256>::new(Some(th), session_key);
     let mut k_s2c = [0u8; 32];
@@ -367,6 +330,7 @@ fn derive_kc_keys(session_key: &[u8; 32], th: &[u8; 32]) -> ([u8; 32], [u8; 32])
     (k_s2c, k_c2s)
 }
 
+/// Computes an HMAC tag over a protocol label and transcript hash.
 fn hmac_tag(key: &[u8; 32], label: &[u8], th: &[u8; 32]) -> [u8; 32] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key size ok");
     mac.update(label);
@@ -377,33 +341,34 @@ fn hmac_tag(key: &[u8; 32], label: &[u8], th: &[u8; 32]) -> [u8; 32] {
     tag
 }
 
-// ============================================================
-// Network helpers
-// ============================================================
+/// Writes the full buffer to the stream and updates the transmitted-byte counter.
 fn send_all(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
     *sent += buf.len();
     stream.write_all(buf)
 }
 
+/// Reads an exact number of bytes from the stream and updates the received-byte counter.
 fn recv_exact(stream: &mut impl Read, buf: &mut [u8], recv: &mut usize) -> std::io::Result<()> {
     stream.read_exact(buf)?;
     *recv += buf.len();
     Ok(())
 }
 
+/// Reads a single byte from the stream.
 fn recv_u8(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<u8> {
     let mut b = [0u8; 1];
     recv_exact(stream, &mut b, recv)?;
     Ok(b[0])
 }
 
+/// Reads a 32-byte device identifier from the stream.
 fn recv_device_id(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<[u8; 32]> {
     let mut id = [0u8; 32];
     recv_exact(stream, &mut id, recv)?;
     Ok(id)
 }
 
-// [FIX-7] reject_identity called on all decompressed points
+/// Reads, decompresses, and validates a Ristretto point received from the peer.
 fn recv_point(stream: &mut impl Read, recv: &mut usize, label: &str) -> std::io::Result<RistrettoPoint> {
     let mut b = [0u8; 32];
     recv_exact(stream, &mut b, recv)?;
@@ -414,7 +379,7 @@ fn recv_point(stream: &mut impl Read, recv: &mut usize, label: &str) -> std::io:
     Ok(p)
 }
 
-// [FIX-10] Uses Option::from(CtOption) for dalek v4 API compatibility
+/// Reads and validates a canonical scalar received from the peer.
 fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scalar> {
     let mut b = [0u8; 32];
     recv_exact(stream, &mut b, recv)?;
@@ -422,7 +387,7 @@ fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scal
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical scalar"))
 }
 
-// [FIX-4] Bounded length-prefixed ciphertext read
+/// Reads a length-prefixed ciphertext while enforcing a strict maximum payload size.
 fn recv_encrypted_blob(
     stream: &mut impl Read,
     recv: &mut usize,
@@ -441,7 +406,7 @@ fn recv_encrypted_blob(
     Ok(buf)
 }
 
-// [FIX-11] Receive the pairing token sent by the client during SETUP
+/// Reads the optional setup pairing token and validates its UTF-8 length constraints.
 fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Option<String>> {
     let len = recv_u8(stream, recv)? as usize;
     if len == 0 {
@@ -460,9 +425,7 @@ fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Resu
     Ok(Some(s))
 }
 
-// ============================================================
-// Registry persistence
-// ============================================================
+/// Loads the device registry mapping device identifiers to registered static public keys.
 fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], RistrettoPoint>> {
     let mut reg = HashMap::new();
     let data = fs::read(path).unwrap_or_default();
@@ -480,6 +443,7 @@ fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], RistrettoPoint
     Ok(reg)
 }
 
+/// Atomically persists the device registry and keeps a backup copy of the previous version.
 fn save_registry_atomic(
     path: &str,
     bak_path: &str,
@@ -500,6 +464,7 @@ fn save_registry_atomic(
     Ok(())
 }
 
+/// Atomically writes sensitive state to disk using a temporary file and private permissions.
 fn write_private_file_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
     ensure_parent_dir(path)?;
     let tmp = format!("{path}.tmp");
@@ -530,6 +495,7 @@ fn write_private_file_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+/// Ensures a sensitive file is not readable by group or world on Unix systems.
 fn verify_private_file_permissions(path: &str) -> std::io::Result<()> {
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
@@ -542,10 +508,12 @@ fn verify_private_file_permissions(path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+/// Ensures a sensitive file is not readable by group or world on Unix systems.
 fn verify_private_file_permissions(_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Reads a file from disk and rejects oversized inputs.
 fn read_file_all(path: &str, max_len: usize) -> std::io::Result<Vec<u8>> {
     let data = fs::read(path)?;
     if data.len() > max_len {
@@ -554,18 +522,21 @@ fn read_file_all(path: &str, max_len: usize) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Parses an X.509 certificate from PEM or DER input.
 fn load_cert_from_bytes(buf: &[u8]) -> std::io::Result<X509> {
     X509::from_pem(buf)
         .or_else(|_| X509::from_der(buf))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("X509 parse failed: {e}")))
 }
 
+/// Parses a private key from PEM or DER input.
 fn load_private_key_from_bytes(buf: &[u8]) -> std::io::Result<PKey<Private>> {
     PKey::private_key_from_pem(buf)
         .or_else(|_| PKey::private_key_from_der(buf))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("private key parse failed: {e}")))
 }
 
+/// Validates a certificate chain, validity interval, and short-lived policy against the configured CA.
 fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
     let now = openssl::asn1::Asn1Time::days_from_now(0)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("time init failed: {e}")))?;
@@ -602,6 +573,7 @@ fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Reads a subject field from a certificate and returns it as lowercase UTF-8 text.
 fn cert_subject_field_hex(cert: &X509, nid: openssl::nid::Nid) -> std::io::Result<String> {
     let name: &X509NameRef = cert.subject_name();
     let entry = name.entries_by_nid(nid).next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("missing subject field {nid:?}")))?;
@@ -609,6 +581,7 @@ fn cert_subject_field_hex(cert: &X509, nid: openssl::nid::Nid) -> std::io::Resul
     Ok(data.to_string().to_ascii_lowercase())
 }
 
+/// Signs a 32-byte transcript hash using the configured certificate private key.
 fn sign_transcript_hash(pkey: &PKey<Private>, th: &[u8; 32]) -> std::io::Result<Vec<u8>> {
     let mut signer = if matches!(pkey.id(), PKeyId::ED25519 | PKeyId::ED448) {
         Signer::new_without_digest(pkey)
@@ -619,6 +592,7 @@ fn sign_transcript_hash(pkey: &PKey<Private>, th: &[u8; 32]) -> std::io::Result<
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("sign failed: {e}")))
 }
 
+/// Verifies a transcript-hash signature using the peer certificate public key.
 fn verify_transcript_hash_sig(pkey: &PKey<Public>, th: &[u8; 32], sig: &[u8]) -> std::io::Result<()> {
     let mut verifier = if matches!(pkey.id(), PKeyId::ED25519 | PKeyId::ED448) {
         Verifier::new_without_digest(pkey)
@@ -630,12 +604,14 @@ fn verify_transcript_hash_sig(pkey: &PKey<Public>, th: &[u8; 32], sig: &[u8]) ->
     if ok { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "signature verification failed")) }
 }
 
+/// Sends a length-prefixed binary blob.
 fn send_blob(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
     send_all(stream, &(buf.len() as u32).to_le_bytes(), sent)?;
     if !buf.is_empty() { send_all(stream, buf, sent)?; }
     Ok(())
 }
 
+/// Receives a length-prefixed binary blob with a caller-supplied maximum length.
 fn recv_blob(stream: &mut impl Read, max_len: usize, recv: &mut usize) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv_exact(stream, &mut len_buf, recv)?;
@@ -646,6 +622,7 @@ fn recv_blob(stream: &mut impl Read, max_len: usize, recv: &mut usize) -> std::i
     Ok(buf)
 }
 
+/// Builds the transcript hash for the mutual-certificate zero-touch provisioning exchange.
 fn ztp_cert_transcript_hash(
     device_id: &[u8; 32],
     device_pub: &[u8; 32],
@@ -669,6 +646,7 @@ fn ztp_cert_transcript_hash(
     th
 }
 
+/// Creates the parent directory for a state file when it does not already exist.
 fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         fs::create_dir_all(parent)?;
@@ -676,6 +654,7 @@ fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Loads the server static secret key from disk or creates one on first boot.
 fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
     if Path::new(path).exists() {
         verify_private_file_permissions(path)?;
@@ -688,7 +667,6 @@ fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
         }
         let mut bb = [0u8; 32];
         bb.copy_from_slice(&b);
-        // [FIX-10] dalek v4: use Option::from(CtOption)
         Option::from(Scalar::from_canonical_bytes(bb)).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "server_sk.bin not canonical")
         })
@@ -699,10 +677,8 @@ fn load_or_create_server_sk(path: &str) -> std::io::Result<Scalar> {
     }
 }
 
-// ============================================================
-// [FIX-5] Two-generation replay cache — no full-clear vulnerability
-// ============================================================
 #[derive(Default)]
+/// Stores recently seen client nonces across two generations to block replayed authentication attempts.
 struct ReplayCache {
     current: HashSet<[u8; 64]>,
     previous: HashSet<[u8; 64]>,
@@ -711,6 +687,7 @@ struct ReplayCache {
     last_persist: Option<Instant>,
 }
 
+/// Stores recently seen client nonces across two generations to block replayed authentication attempts.
 impl ReplayCache {
     fn load(path: &str) -> std::io::Result<Self> {
         if !Path::new(path).exists() {
@@ -793,16 +770,15 @@ impl ReplayCache {
     }
 }
 
-// ============================================================
-// [FIX-1] Pairing policy — token enforced with constant-time comparison
-// ============================================================
 #[derive(Clone)]
+/// Defines whether zero-touch setup is currently allowed and which optional token/deadline policy applies.
 struct PairingPolicy {
     enabled: bool,
     token: Option<String>,
     deadline: Option<Instant>,
 }
 
+/// Defines whether zero-touch setup is currently allowed and which optional token/deadline policy applies.
 impl PairingPolicy {
     fn allows_ztp_setup(&self, provided_token: Option<&str>) -> bool {
         if !self.enabled {
@@ -813,7 +789,6 @@ impl PairingPolicy {
                 return false;
             }
         }
-        // [FIX-1] Constant-time token comparison
         match (&self.token, provided_token) {
             (Some(expected), Some(got)) => {
                 expected.as_bytes().ct_eq(got.as_bytes()).into()
@@ -826,6 +801,7 @@ impl PairingPolicy {
 
 
 #[derive(Clone)]
+/// Tracks recent failures for one peer so the server can rate-limit abusive sources.
 struct FailureState {
     first_failure: Instant,
     failures: u32,
@@ -833,10 +809,12 @@ struct FailureState {
 }
 
 #[derive(Default)]
+/// Maintains rolling failure counters and temporary blocks for peers that exceed policy.
 struct FailureTracker {
     peers: HashMap<String, FailureState>,
 }
 
+/// Maintains rolling failure counters and temporary blocks for peers that exceed policy.
 impl FailureTracker {
     fn is_blocked(&mut self, peer: &str) -> bool {
         let now = Instant::now();
@@ -872,10 +850,12 @@ impl FailureTracker {
     }
 }
 
+/// RAII guard that increments the active-connection count on entry and decrements it on drop.
 struct ActiveConnGuard {
     active: Arc<AtomicUsize>,
 }
 
+/// RAII guard that increments the active-connection count on entry and decrements it on drop.
 impl ActiveConnGuard {
     fn try_acquire(active: Arc<AtomicUsize>) -> Option<Self> {
         loop {
@@ -893,12 +873,14 @@ impl ActiveConnGuard {
     }
 }
 
+/// Implements helper methods for drop.
 impl Drop for ActiveConnGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
+/// Extracts the OpenSSL textual representation of a certificate for extension checks.
 fn cert_text(cert: &X509) -> std::io::Result<String> {
     let text = cert
         .to_text()
@@ -906,6 +888,7 @@ fn cert_text(cert: &X509) -> std::io::Result<String> {
     String::from_utf8(text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text utf8 failed: {e}")))
 }
 
+/// Rejects certificates whose validity window exceeds the configured maximum lifetime.
 fn enforce_short_lived_cert(cert: &X509) -> std::io::Result<()> {
     let diff = cert.not_after()
         .diff(cert.not_before())
@@ -919,6 +902,7 @@ fn enforce_short_lived_cert(cert: &X509) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Checks that the certificate contains the expected Extended Key Usage value.
 fn require_eku(cert: &X509, required_eku: &str) -> std::io::Result<()> {
     let text = cert_text(cert)?;
     let has_eku_section = text.contains("Extended Key Usage");
@@ -931,6 +915,7 @@ fn require_eku(cert: &X509, required_eku: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Checks that the custom identity extension is present and matches the expected hex-encoded identity.
 fn require_custom_identity_extension(cert: &X509, oid: &str, expected_hex: &str) -> std::io::Result<()> {
     let text = cert_text(cert)?;
     let oid_pos = text.find(oid).ok_or_else(|| {
@@ -952,6 +937,7 @@ fn require_custom_identity_extension(cert: &X509, oid: &str, expected_hex: &str)
 
 
 #[derive(Debug, Clone)]
+/// Represents a serialized offline authorization proof and its metadata.
 struct OfflineProof {
     version: u8,
     device_id: [u8; 32],
@@ -966,6 +952,7 @@ struct OfflineProof {
     s: [u8; 32],
 }
 
+/// Represents a serialized offline authorization proof and its metadata.
 impl OfflineProof {
     fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
         let mut idx = 0usize;
@@ -1009,10 +996,12 @@ impl OfflineProof {
 }
 
 #[derive(Default)]
+/// Stores the highest accepted offline-proof counter for each device.
 struct OfflineCounterStore {
     highest: HashMap<[u8; 32], u64>,
 }
 
+/// Stores the highest accepted offline-proof counter for each device.
 impl OfflineCounterStore {
     fn load(path: &str) -> std::io::Result<Self> {
         if !Path::new(path).exists() {
@@ -1055,6 +1044,7 @@ impl OfflineCounterStore {
     }
 }
 
+/// Returns the current Unix timestamp in seconds.
 fn unix_time_now() -> std::io::Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1062,6 +1052,7 @@ fn unix_time_now() -> std::io::Result<u64> {
         .as_secs())
 }
 
+/// Builds the challenge scalar used for offline authorization proofs.
 fn offline_challenge_scalar(
     device_id: &[u8; 32],
     device_pub: &RistrettoPoint,
@@ -1089,6 +1080,7 @@ fn offline_challenge_scalar(
     )
 }
 
+/// Verifies an offline authorization proof against registry state, scope policy, counter monotonicity, and expiry.
 fn verify_offline_proof(
     proof_path: &str,
     expected_audience: &str,
@@ -1157,11 +1149,9 @@ fn verify_offline_proof(
     Ok(())
 }
 
-// ============================================================
-// Handlers
-// ============================================================
 
 #[derive(Clone, Debug)]
+/// Stores continuity-tracking state that links one successful session to the next.
 struct ContinuityState {
     version: u8,
     role: u8,
@@ -1175,6 +1165,7 @@ struct ContinuityState {
 }
 
 #[derive(Clone, Debug)]
+/// Represents a continuity proof used to bind reconnects to prior state.
 struct ContinuityProof {
     version: u8,
     role: u8,
@@ -1192,6 +1183,7 @@ struct ContinuityProof {
     s: [u8; 32],
 }
 
+/// Parses a 32-byte value from a 64-character hexadecimal string.
 fn parse_hash32_hex(s: &str) -> std::io::Result<[u8; 32]> {
     let decoded = hex::decode(s).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex string")
@@ -1207,6 +1199,7 @@ fn parse_hash32_hex(s: &str) -> std::io::Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Stores continuity-tracking state that links one successful session to the next.
 impl ContinuityState {
     fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(178);
@@ -1242,6 +1235,7 @@ impl ContinuityState {
     }
 }
 
+/// Represents a continuity proof used to bind reconnects to prior state.
 impl ContinuityProof {
     fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(290);
@@ -1287,6 +1281,7 @@ impl ContinuityProof {
     }
 }
 
+/// Derives the next continuity checkpoint hash from the previous checkpoint and current state.
 fn next_checkpoint_hash(prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     sha2::Digest::update(&mut h, b"continuity-checkpoint-v1");
@@ -1301,6 +1296,7 @@ fn next_checkpoint_hash(prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], 
     r
 }
 
+/// Builds the Schnorr-style challenge scalar used for continuity proofs.
 fn continuity_challenge_scalar(domain: &[u8], role: u8, identity: &[u8; 32], pubkey: &RistrettoPoint, peer_id: &[u8; 32], issued_at: u64, expires_at: u64, continuity_counter: u64, reconnect_epoch: u64, prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], checkpoint_hash: &[u8; 32], a: &RistrettoPoint) -> Scalar {
     transcript_challenge_scalar(
         domain,
@@ -1321,6 +1317,7 @@ fn continuity_challenge_scalar(domain: &[u8], role: u8, identity: &[u8; 32], pub
     )
 }
 
+/// Derives a stable server identity from the server public key.
 fn server_identity_from_pub(p: &RistrettoPoint) -> [u8; 32] {
     let mut h = Sha256::new();
     sha2::Digest::update(&mut h, b"server-id-v1");
@@ -1331,6 +1328,7 @@ fn server_identity_from_pub(p: &RistrettoPoint) -> [u8; 32] {
     r
 }
 
+/// Hashes the server continuity state together with registry state and peer identity.
 fn hash_server_continuity_state(server_identity: &[u8; 32], server_pub: &[u8; 32], registry: &HashMap<[u8; 32], RistrettoPoint>, continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     sha2::Digest::update(&mut h, b"server-state-v1");
@@ -1351,6 +1349,7 @@ fn hash_server_continuity_state(server_identity: &[u8; 32], server_pub: &[u8; 32
     r
 }
 
+/// Loads or initializes the server continuity chain state.
 fn load_or_init_server_continuity_state(
     server_static_pub: &RistrettoPoint,
     registry: &HashMap<[u8; 32], RistrettoPoint>,
@@ -1391,8 +1390,10 @@ fn load_or_init_server_continuity_state(
     Ok(st)
 }
 
+/// Persists the server continuity chain state.
 fn save_server_continuity_state(st: &ContinuityState) -> std::io::Result<()> { write_private_file_atomic(SERVER_CONTINUITY_FILE, &st.serialize()) }
 
+/// Loads per-client continuity tracking records from disk.
 fn client_tracks_load() -> std::io::Result<HashMap<[u8;32], ContinuityState>> {
     if !Path::new(CLIENT_CONTINUITY_TRACKS_BIN).exists() { return Ok(HashMap::new()); }
     verify_private_file_permissions(CLIENT_CONTINUITY_TRACKS_BIN)?;
@@ -1406,6 +1407,7 @@ fn client_tracks_load() -> std::io::Result<HashMap<[u8;32], ContinuityState>> {
     Ok(out)
 }
 
+/// Persists per-client continuity tracking records to disk.
 fn client_tracks_save(m: &HashMap<[u8;32], ContinuityState>) -> std::io::Result<()> {
     let mut keys: Vec<[u8;32]> = m.keys().copied().collect();
     keys.sort();
@@ -1414,6 +1416,7 @@ fn client_tracks_save(m: &HashMap<[u8;32], ContinuityState>) -> std::io::Result<
     write_private_file_atomic(CLIENT_CONTINUITY_TRACKS_BIN, &out)
 }
 
+/// Builds a server continuity proof file for a specific peer.
 fn build_server_continuity_proof(output_path: &str, server_static_secret: &Scalar, server_static_pub: &RistrettoPoint, registry: &HashMap<[u8;32], RistrettoPoint>, peer_id: [u8;32], expires_in: u64) -> std::io::Result<()> {
     if expires_in == 0 || expires_in > 300 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in must be between 1 and 300")); }
     let mut st = load_or_init_server_continuity_state(server_static_pub, registry, &peer_id)?;
@@ -1436,6 +1439,7 @@ fn build_server_continuity_proof(output_path: &str, server_static_secret: &Scala
     Ok(())
 }
 
+/// Verifies a client continuity proof against the registered client key.
 fn verify_client_continuity_proof(path: &str, reg: &HashMap<[u8;32], RistrettoPoint>) -> std::io::Result<()> {
     let proof = ContinuityProof::deserialize(&fs::read(path)?)?;
     if proof.role != 1 { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "proof is not a client continuity proof")); }
@@ -1443,6 +1447,7 @@ fn verify_client_continuity_proof(path: &str, reg: &HashMap<[u8;32], RistrettoPo
     if expected_pub.compress().to_bytes().ct_eq(&proof.pubkey).unwrap_u8() == 0 {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity pubkey mismatch"));
     }
+    // Step 2: load the long-term server secret and validate the server certificate that represents it.
     let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
     let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
     let expected_peer_id = server_identity_from_pub(&server_static_pub);
@@ -1483,6 +1488,8 @@ fn verify_client_continuity_proof(path: &str, reg: &HashMap<[u8;32], RistrettoPo
     Ok(())
 }
 
+/// Processes a client setup request, validates certificates and setup proofs, enforces pairing policy, and registers the client key.
+/// Step 1: read the incoming setup request, pairing token, client identity, and certificate material.
 fn handle_setup(
     stream: &mut TcpStream,
     policy: &PairingPolicy,
@@ -1584,6 +1591,8 @@ fn handle_setup(
     Ok(())
 }
 
+/// Processes a live authentication request, enforces replay protection, verifies the registered client, derives the session, and completes key confirmation.
+/// Step 1: establish the outer X25519 tunnel and receive the client's encrypted authentication payload.
 fn handle_auth_v2(
     stream: &mut TcpStream,
     server_static_secret: &Scalar,
@@ -1595,7 +1604,6 @@ fn handle_auth_v2(
     failures: &Arc<Mutex<FailureTracker>>,
     peer_key: &str,
 ) -> std::io::Result<()> {
-    // ── 1. Anonymous ephemeral X25519 key exchange ────────────────────────────
     let mut client_pk_bytes = [0u8; 32];
     recv_exact(stream, &mut client_pk_bytes, recv)?;
     let client_pk = X25519Public::from(client_pk_bytes);
@@ -1605,9 +1613,7 @@ fn handle_auth_v2(
     send_all(stream, server_pk.as_bytes(), sent)?;
     stream.flush()?;
 
-    // Derive tunnel keys (libsodium crypto_kx order)
     let shared_secret = server_sk.diffie_hellman(&client_pk);
-    // [FIX-8] Save raw shared secret bytes to bind into session key later
     let mut x25519_shared_bytes: [u8; 32] = *shared_secret.as_bytes();
 
     let mut hasher = Blake2b512::new();
@@ -1618,18 +1624,15 @@ fn handle_auth_v2(
 
     let mut rx_key = [0u8; 32];
     let mut tx_key = [0u8; 32];
-    rx_key.copy_from_slice(&hash[32..64]); // C→S (server RX)
-    tx_key.copy_from_slice(&hash[0..32]);  // S→C (server TX)
+    rx_key.copy_from_slice(&hash[32..64]);
+    tx_key.copy_from_slice(&hash[0..32]);
 
     let cipher_rx = ChaCha20Poly1305::new(&rx_key.into());
     let cipher_tx = ChaCha20Poly1305::new(&tx_key.into());
 
-    // [FIX-9] Separate nonce counters per direction
     let mut nonce_rx_ctr = NonceCounter::new();
     let mut nonce_tx_ctr = NonceCounter::new();
 
-    // ── 2. Decrypt client identity payload ───────────────────────────────────
-    // [FIX-4] Bounded allocation
     let rx_ct = recv_encrypted_blob(stream, recv)?;
     let pt = cipher_rx
         .decrypt(&nonce_rx_ctr.next(), rx_ct.as_ref())
@@ -1648,13 +1651,11 @@ fn handle_auth_v2(
     let mut nonce_c     = [0u8; 32]; nonce_c.copy_from_slice(&pt[96..128]);
     let mut eph_c_bytes = [0u8; 32]; eph_c_bytes.copy_from_slice(&pt[128..160]);
 
-    // [FIX-2] [FIX-7] Proper error propagation, no unwrap on adversary data
     let a_c = CompressedRistretto(a_c_bytes)
         .decompress()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid a_c"))?;
     reject_identity(&a_c, "a_c")?;
 
-    // [FIX-10] dalek v4 CtOption API
     let s_c = Option::from(Scalar::from_canonical_bytes(s_c_bytes))
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical s_c"))?;
 
@@ -1663,7 +1664,6 @@ fn handle_auth_v2(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_c"))?;
     reject_identity(&eph_c, "eph_c")?;
 
-    // ── 3. Replay & Schnorr verification ─────────────────────────────────────
     if failures.lock().unwrap().is_blocked(peer_key) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
     }
@@ -1682,6 +1682,7 @@ fn handle_auth_v2(
         write_private_file_atomic(REPLAY_CACHE_BIN, &blob)?;
     }
 
+    // Step 4: look up the registered device key and verify the client Schnorr proof against it.
     let expected_pub = {
         let reg_r = reg.read().unwrap();
         match reg_r.get(&device_id) {
@@ -1702,13 +1703,12 @@ fn handle_auth_v2(
         ));
     }
 
-    // ── 4. Build encrypted server response ───────────────────────────────────
     let nonce_s = random_bytes_32();
     let mut eph_s_secret = random_scalar();
     let eph_s = RISTRETTO_BASEPOINT_POINT * eph_s_secret;
+    // Step 5: build the server proof, derive the authenticated session key, and send the server key-confirmation tag.
     let (a_s, s_s) = schnorr_prove_server(server_static_secret, &nonce_s, &eph_s);
 
-    // [FIX-8] Pass x25519_shared_bytes into session key derivation
     let mut session_key = derive_session_key(
         &eph_s_secret, &eph_c, &nonce_c, &nonce_s,
         &device_id, &eph_c, &eph_s, &x25519_shared_bytes,
@@ -1728,8 +1728,6 @@ fn handle_auth_v2(
     payload2.extend_from_slice(eph_s.compress().as_bytes());
     payload2.extend_from_slice(&tag_s);
 
-    // [FIX-2] Proper error propagation on encrypt
-    // [FIX-9] NonceCounter manages the TX nonce
     let ct2 = cipher_tx
         .encrypt(&nonce_tx_ctr.next(), payload2.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encrypt failed"))?;
@@ -1739,11 +1737,8 @@ fn handle_auth_v2(
     send_all(stream, &ct2, sent)?;
     stream.flush()?;
 
-    // ── 5. Decrypt and verify client finished tag ─────────────────────────────
-    // [FIX-4] Bounded allocation
     let rx_ct2 = recv_encrypted_blob(stream, recv)?;
 
-    // [FIX-9] NonceCounter advances automatically
     let tag_c_plain = cipher_rx
         .decrypt(&nonce_rx_ctr.next(), rx_ct2.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed on tag_c"))?;
@@ -1757,7 +1752,6 @@ fn handle_auth_v2(
 
     let expected_tag_c = hmac_tag(&k_c2s, b"client finished", &th);
 
-    // [FIX-3] Constant-time comparison
     let tag_c_arr: [u8; 32] = tag_c_plain.try_into().unwrap();
     if expected_tag_c.ct_eq(&tag_c_arr).unwrap_u8() == 0 {
         return Err(std::io::Error::new(
@@ -1783,6 +1777,8 @@ fn handle_auth_v2(
     Ok(())
 }
 
+/// Dispatches one inbound TCP client connection to the appropriate protocol handler.
+/// Step 1: rate-limit abusive peers, cap concurrency, and identify the requested message type.
 fn handle_client(
     mut stream: TcpStream,
     server_static_secret: Arc<Scalar>,
@@ -1852,9 +1848,8 @@ fn handle_client(
     );
 }
 
-// ============================================================
-// MAIN
-// ============================================================
+/// Parses CLI arguments, loads local credentials, and dispatches to setup, live authentication, offline proof, or continuity operations.
+/// Step 1: parse server flags, pairing options, verification utilities, and bind address.
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let prog = args.get(0).cloned().unwrap_or_else(|| "server".to_string());
@@ -1962,6 +1957,7 @@ fn main() -> std::io::Result<()> {
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
 
+    // Step 3: handle utility modes such as offline-proof verification or continuity-proof generation.
     if let Some(proof_path) = verify_offline_path.as_deref() {
         let audience = offline_audience.as_deref().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-offline-proof requires --audience")
@@ -1983,6 +1979,7 @@ fn main() -> std::io::Result<()> {
         let peer_id = continuity_peer_id.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-server-continuity-proof requires --peer-id"))?;
         return build_server_continuity_proof(path, &server_static_secret, &server_static_pub, &reg_map, peer_id, continuity_expires_in);
     }
+    // Step 4: initialize shared server state and begin accepting TCP clients.
     let reg = Arc::new(RwLock::new(reg_map));
     let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
     let replay = Arc::new(Mutex::new(replay_state));
