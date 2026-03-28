@@ -38,7 +38,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
@@ -74,6 +74,9 @@ const SERVER_SK_FILE: &str = "/var/lib/iot-auth/server/server_sk.bin";
 const SERVER_CERT_FILE: &str = "/var/lib/iot-auth/server/server_cert.pem";
 const SERVER_CERT_KEY_FILE: &str = "/var/lib/iot-auth/server/server_cert_key.pem";
 const CA_CERT_FILE: &str = "/var/lib/iot-auth/server/ca_cert.pem";
+const OFFLINE_COUNTERS_BIN: &str = "/var/lib/iot-auth/server/offline_counters.bin";
+const SERVER_CONTINUITY_FILE: &str = "/var/lib/iot-auth/server/continuity.bin";
+const CLIENT_CONTINUITY_TRACKS_BIN: &str = "/var/lib/iot-auth/server/client_continuity_tracks.bin";
 const MAX_CERT_FILE_SIZE: usize = 128 * 1024;
 const MAX_SIG_SIZE: usize = 8192;
 
@@ -81,6 +84,9 @@ const T_SETUP: &[u8] = b"setup_schnorr_v1";
 const T_CLIENT: &[u8] = b"client_schnorr_v1";
 const T_SERVER: &[u8] = b"server_schnorr_v1";
 const T_KC: &[u8] = b"kc_v1";
+const T_OFFLINE: &[u8] = b"offline_schnorr_v1";
+const T_CLIENT_CONT: &[u8] = b"client_continuity_v1";
+const T_SERVER_CONT: &[u8] = b"server_continuity_v1";
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -92,6 +98,8 @@ const REPLAY_GEN_MAX: usize = 25_000;
 const REPLAY_PERSIST_EVERY_INSERTS: usize = 64;
 const REPLAY_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_ACTIVE_CONNECTIONS: usize = 128;
+const MAX_OFFLINE_FIELD: usize = 256;
+//const MAX_CONTINUITY_FIELD: usize = 256;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_BAN: Duration = Duration::from_secs(120);
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
@@ -159,6 +167,38 @@ impl CompatTranscript {
     }
 }
 
+
+#[derive(Clone, Copy)]
+enum TranscriptValue<'a> {
+    Bytes(&'a [u8]),
+    U64(u64),
+    U8(u8),
+    Point(&'a RistrettoPoint),
+    Scalar(&'a Scalar),
+}
+
+fn append_tv(t: &mut CompatTranscript, label: &[u8], v: TranscriptValue<'_>) {
+    match v {
+        TranscriptValue::Bytes(b) => t.append_message(label, b),
+        TranscriptValue::U64(n) => t.append_message(label, &n.to_le_bytes()),
+        TranscriptValue::U8(n) => t.append_message(label, &[n]),
+        TranscriptValue::Point(p) => t.append_message(label, p.compress().as_bytes()),
+        TranscriptValue::Scalar(s) => t.append_message(label, &s.to_bytes()),
+    }
+}
+
+fn build_transcript(domain: &[u8], fields: &[(&[u8], TranscriptValue<'_>)]) -> CompatTranscript {
+    let mut t = CompatTranscript::new(domain);
+    for (label, value) in fields {
+        append_tv(&mut t, label, *value);
+    }
+    t
+}
+
+fn transcript_challenge_scalar(domain: &[u8], fields: &[(&[u8], TranscriptValue<'_>)]) -> Scalar {
+    build_transcript(domain, fields).challenge_scalar()
+}
+
 // ============================================================
 // Crypto helpers
 // ============================================================
@@ -195,12 +235,15 @@ fn schnorr_verify_setup(
     a: &RistrettoPoint,
     s: &Scalar,
 ) -> bool {
-    let mut t = CompatTranscript::new(T_SETUP);
-    t.append_message(b"device_id", device_id);
-    t.append_message(b"pubkey", pubkey.compress().as_bytes());
-    t.append_message(b"a", a.compress().as_bytes());
-    t.append_message(b"server_nonce", server_nonce);
-    let c = t.challenge_scalar();
+    let c = transcript_challenge_scalar(
+        T_SETUP,
+        &[
+            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"pubkey", TranscriptValue::Point(pubkey)),
+            (b"a", TranscriptValue::Point(a)),
+            (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
+        ],
+    );
     RISTRETTO_BASEPOINT_POINT * s == a + pubkey * c
 }
 
@@ -212,13 +255,16 @@ fn schnorr_verify_auth(
     nonce_c: &[u8; 32],
     eph_c: &RistrettoPoint,
 ) -> bool {
-    let mut t = CompatTranscript::new(T_CLIENT);
-    t.append_message(b"device_id", device_id);
-    t.append_message(b"pubkey", expected_pubkey.compress().as_bytes());
-    t.append_message(b"a", a.compress().as_bytes());
-    t.append_message(b"nonce_c", nonce_c);
-    t.append_message(b"eph_c", eph_c.compress().as_bytes());
-    let c = t.challenge_scalar();
+    let c = transcript_challenge_scalar(
+        T_CLIENT,
+        &[
+            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"pubkey", TranscriptValue::Point(expected_pubkey)),
+            (b"a", TranscriptValue::Point(a)),
+            (b"nonce_c", TranscriptValue::Bytes(nonce_c)),
+            (b"eph_c", TranscriptValue::Point(eph_c)),
+        ],
+    );
     RISTRETTO_BASEPOINT_POINT * s == a + expected_pubkey * c
 }
 
@@ -230,12 +276,15 @@ fn schnorr_prove_server(
     let pubkey = RISTRETTO_BASEPOINT_POINT * server_secret;
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
-    let mut t = CompatTranscript::new(T_SERVER);
-    t.append_message(b"pubkey", pubkey.compress().as_bytes());
-    t.append_message(b"a", a.compress().as_bytes());
-    t.append_message(b"nonce_s", nonce_s);
-    t.append_message(b"eph_s", eph_s.compress().as_bytes());
-    let c = t.challenge_scalar();
+    let c = transcript_challenge_scalar(
+        T_SERVER,
+        &[
+            (b"pubkey", TranscriptValue::Point(&pubkey)),
+            (b"a", TranscriptValue::Point(&a)),
+            (b"nonce_s", TranscriptValue::Bytes(nonce_s)),
+            (b"eph_s", TranscriptValue::Point(eph_s)),
+        ],
+    );
     let s = r + c * server_secret;
     (a, s)
 }
@@ -900,9 +949,539 @@ fn require_custom_identity_extension(cert: &X509, oid: &str, expected_hex: &str)
     Ok(())
 }
 
+
+
+#[derive(Debug, Clone)]
+struct OfflineProof {
+    version: u8,
+    device_id: [u8; 32],
+    device_pub: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    counter: u64,
+    audience: Vec<u8>,
+    scope: Vec<u8>,
+    request_hash: [u8; 32],
+    a: [u8; 32],
+    s: [u8; 32],
+}
+
+impl OfflineProof {
+    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
+        let mut idx = 0usize;
+        fn take<'a>(buf: &'a [u8], idx: &mut usize, n: usize) -> std::io::Result<&'a [u8]> {
+            if buf.len().saturating_sub(*idx) < n {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof truncated"));
+            }
+            let out = &buf[*idx..*idx + n];
+            *idx += n;
+            Ok(out)
+        }
+        let version = take(buf, &mut idx, 1)?[0];
+        let mut device_id = [0u8; 32];
+        device_id.copy_from_slice(take(buf, &mut idx, 32)?);
+        let mut device_pub = [0u8; 32];
+        device_pub.copy_from_slice(take(buf, &mut idx, 32)?);
+        let issued_at = u64::from_le_bytes(take(buf, &mut idx, 8)?.try_into().unwrap());
+        let expires_at = u64::from_le_bytes(take(buf, &mut idx, 8)?.try_into().unwrap());
+        let counter = u64::from_le_bytes(take(buf, &mut idx, 8)?.try_into().unwrap());
+        let audience_len = u16::from_le_bytes(take(buf, &mut idx, 2)?.try_into().unwrap()) as usize;
+        if audience_len == 0 || audience_len > MAX_OFFLINE_FIELD {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid offline audience length"));
+        }
+        let audience = take(buf, &mut idx, audience_len)?.to_vec();
+        let scope_len = u16::from_le_bytes(take(buf, &mut idx, 2)?.try_into().unwrap()) as usize;
+        if scope_len == 0 || scope_len > MAX_OFFLINE_FIELD {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid offline scope length"));
+        }
+        let scope = take(buf, &mut idx, scope_len)?.to_vec();
+        let mut request_hash = [0u8; 32];
+        request_hash.copy_from_slice(take(buf, &mut idx, 32)?);
+        let mut a = [0u8; 32];
+        a.copy_from_slice(take(buf, &mut idx, 32)?);
+        let mut s = [0u8; 32];
+        s.copy_from_slice(take(buf, &mut idx, 32)?);
+        if idx != buf.len() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof has trailing bytes"));
+        }
+        Ok(Self { version, device_id, device_pub, issued_at, expires_at, counter, audience, scope, request_hash, a, s })
+    }
+}
+
+#[derive(Default)]
+struct OfflineCounterStore {
+    highest: HashMap<[u8; 32], u64>,
+}
+
+impl OfflineCounterStore {
+    fn load(path: &str) -> std::io::Result<Self> {
+        if !Path::new(path).exists() {
+            return Ok(Self::default());
+        }
+        let data = fs::read(path)?;
+        if data.len() % 40 != 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline counter store corrupt"));
+        }
+        let mut highest = HashMap::new();
+        for chunk in data.chunks_exact(40) {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&chunk[..32]);
+            let ctr = u64::from_le_bytes(chunk[32..40].try_into().unwrap());
+            highest.insert(id, ctr);
+        }
+        Ok(Self { highest })
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.highest.len() * 40);
+        for (id, ctr) in &self.highest {
+            out.extend_from_slice(id);
+            out.extend_from_slice(&ctr.to_le_bytes());
+        }
+        out
+    }
+
+    fn check_and_update(&mut self, device_id: &[u8; 32], counter: u64) -> std::io::Result<()> {
+        match self.highest.get(device_id).copied() {
+            Some(prev) if counter <= prev => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("offline counter replay detected (counter={} prev={})", counter, prev),
+            )),
+            _ => {
+                self.highest.insert(*device_id, counter);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn unix_time_now() -> std::io::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("system time error: {e}")))?
+        .as_secs())
+}
+
+fn offline_challenge_scalar(
+    device_id: &[u8; 32],
+    device_pub: &RistrettoPoint,
+    audience: &[u8],
+    scope: &[u8],
+    issued_at: u64,
+    expires_at: u64,
+    counter: u64,
+    request_hash: &[u8; 32],
+    a: &RistrettoPoint,
+) -> Scalar {
+    transcript_challenge_scalar(
+        T_OFFLINE,
+        &[
+            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"pubkey", TranscriptValue::Point(device_pub)),
+            (b"audience", TranscriptValue::Bytes(audience)),
+            (b"scope", TranscriptValue::Bytes(scope)),
+            (b"issued_at", TranscriptValue::U64(issued_at)),
+            (b"expires_at", TranscriptValue::U64(expires_at)),
+            (b"counter", TranscriptValue::U64(counter)),
+            (b"request_hash", TranscriptValue::Bytes(request_hash)),
+            (b"a", TranscriptValue::Point(a)),
+        ],
+    )
+}
+
+fn verify_offline_proof(
+    proof_path: &str,
+    expected_audience: &str,
+    allowed_scopes: &HashSet<String>,
+    reg: &HashMap<[u8; 32], RistrettoPoint>,
+    counters: &mut OfflineCounterStore,
+) -> std::io::Result<()> {
+    let proof = OfflineProof::deserialize(&fs::read(proof_path)?)?;
+    if proof.version != 1 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unsupported offline proof version"));
+    }
+    if proof.audience != expected_audience.as_bytes() {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof audience mismatch"));
+    }
+    let scope_str = String::from_utf8(proof.scope.clone())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "offline scope is not UTF-8"))?;
+    if !allowed_scopes.contains(&scope_str) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("offline scope '{}' not allowed", scope_str)));
+    }
+    if proof.issued_at >= proof.expires_at {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof validity window is invalid"));
+    }
+    let now = unix_time_now()?;
+    if now < proof.issued_at || now > proof.expires_at {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof expired or not yet valid"));
+    }
+    if proof.expires_at - proof.issued_at > 300 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof validity exceeds 300 seconds"));
+    }
+    let expected_pub = reg.get(&proof.device_id).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof device is not enrolled")
+    })?;
+    if expected_pub.compress().to_bytes().ct_eq(&proof.device_pub).unwrap_u8() == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline proof pubkey mismatch"));
+    }
+    let a = CompressedRistretto(proof.a)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof A invalid"))?;
+    reject_identity(&a, "offline A")?;
+    let s: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.s))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "offline proof s is non-canonical"))?;
+    let c: Scalar = offline_challenge_scalar(
+        &proof.device_id,
+        expected_pub,
+        &proof.audience,
+        &proof.scope,
+        proof.issued_at,
+        proof.expires_at,
+        proof.counter,
+        &proof.request_hash,
+        &a,
+    );
+    if RISTRETTO_BASEPOINT_POINT * s != a + (*expected_pub * c) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "offline Schnorr proof invalid"));
+    }
+    counters.check_and_update(&proof.device_id, proof.counter)?;
+    write_private_file_atomic(OFFLINE_COUNTERS_BIN, &counters.serialize())?;
+    println!(
+        "Server[OFFLINE]: verified offline proof file={} device_id={} scope='{}' counter={} request_hash={}",
+        proof_path,
+        hex::encode(proof.device_id),
+        scope_str,
+        proof.counter,
+        hex::encode(proof.request_hash)
+    );
+    Ok(())
+}
+
 // ============================================================
 // Handlers
 // ============================================================
+
+#[derive(Clone, Debug)]
+struct ContinuityState {
+    version: u8,
+    role: u8,
+    identity: [u8; 32],
+    pubkey: [u8; 32],
+    continuity_counter: u64,
+    reconnect_epoch: u64,
+    last_peer_id: [u8; 32],
+    last_checkpoint_hash: [u8; 32],
+    state_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct ContinuityProof {
+    version: u8,
+    role: u8,
+    identity: [u8; 32],
+    pubkey: [u8; 32],
+    peer_id: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    continuity_counter: u64,
+    reconnect_epoch: u64,
+    prev_checkpoint_hash: [u8; 32],
+    state_hash: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    a: [u8; 32],
+    s: [u8; 32],
+}
+
+fn parse_hash32_hex(s: &str) -> std::io::Result<[u8; 32]> {
+    let decoded = hex::decode(s).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex string")
+    })?;
+    if decoded.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected exactly 32 bytes of hex data",
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&decoded);
+    Ok(out)
+}
+
+impl ContinuityState {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(178);
+        out.push(self.version);
+        out.push(self.role);
+        out.extend_from_slice(&self.identity);
+        out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&self.continuity_counter.to_le_bytes());
+        out.extend_from_slice(&self.reconnect_epoch.to_le_bytes());
+        out.extend_from_slice(&self.last_peer_id);
+        out.extend_from_slice(&self.last_checkpoint_hash);
+        out.extend_from_slice(&self.state_hash);
+        out
+    }
+    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
+        if buf.len() != 178 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("continuity state wrong length: got {}, expected 178", buf.len()),
+            ));
+        }
+        let mut off = 0usize;
+        let version = buf[off]; off += 1;
+        let role = buf[off]; off += 1;
+        let mut identity = [0u8; 32]; identity.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut pubkey = [0u8; 32]; pubkey.copy_from_slice(&buf[off..off+32]); off += 32;
+        let continuity_counter = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
+        let reconnect_epoch = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
+        let mut last_peer_id = [0u8; 32]; last_peer_id.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut last_checkpoint_hash = [0u8; 32]; last_checkpoint_hash.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut state_hash = [0u8; 32]; state_hash.copy_from_slice(&buf[off..off+32]);
+        Ok(Self { version, role, identity, pubkey, continuity_counter, reconnect_epoch, last_peer_id, last_checkpoint_hash, state_hash })
+    }
+}
+
+impl ContinuityProof {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(290);
+        out.push(self.version);
+        out.push(self.role);
+        out.extend_from_slice(&self.identity);
+        out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&self.peer_id);
+        out.extend_from_slice(&self.issued_at.to_le_bytes());
+        out.extend_from_slice(&self.expires_at.to_le_bytes());
+        out.extend_from_slice(&self.continuity_counter.to_le_bytes());
+        out.extend_from_slice(&self.reconnect_epoch.to_le_bytes());
+        out.extend_from_slice(&self.prev_checkpoint_hash);
+        out.extend_from_slice(&self.state_hash);
+        out.extend_from_slice(&self.checkpoint_hash);
+        out.extend_from_slice(&self.a);
+        out.extend_from_slice(&self.s);
+        out
+    }
+    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
+        if buf.len() != 290 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("continuity proof wrong length: got {}, expected 290", buf.len()),
+            ));
+        }
+        let mut off = 0usize;
+        let version = buf[off]; off += 1;
+        let role = buf[off]; off += 1;
+        let mut identity = [0u8; 32]; identity.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut pubkey = [0u8; 32]; pubkey.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut peer_id = [0u8; 32]; peer_id.copy_from_slice(&buf[off..off+32]); off += 32;
+        let issued_at = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
+        let expires_at = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
+        let continuity_counter = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
+        let reconnect_epoch = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
+        let mut prev_checkpoint_hash = [0u8; 32]; prev_checkpoint_hash.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut state_hash = [0u8; 32]; state_hash.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut checkpoint_hash = [0u8; 32]; checkpoint_hash.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut a = [0u8; 32]; a.copy_from_slice(&buf[off..off+32]); off += 32;
+        let mut s = [0u8; 32]; s.copy_from_slice(&buf[off..off+32]);
+        Ok(Self { version, role, identity, pubkey, peer_id, issued_at, expires_at, continuity_counter, reconnect_epoch, prev_checkpoint_hash, state_hash, checkpoint_hash, a, s })
+    }
+}
+
+fn next_checkpoint_hash(prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, b"continuity-checkpoint-v1");
+    sha2::Digest::update(&mut h, prev_checkpoint_hash);
+    sha2::Digest::update(&mut h, state_hash);
+    sha2::Digest::update(&mut h, &continuity_counter.to_le_bytes());
+    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
+    sha2::Digest::update(&mut h, peer_id);
+    let out = h.finalize();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out);
+    r
+}
+
+fn continuity_challenge_scalar(domain: &[u8], role: u8, identity: &[u8; 32], pubkey: &RistrettoPoint, peer_id: &[u8; 32], issued_at: u64, expires_at: u64, continuity_counter: u64, reconnect_epoch: u64, prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], checkpoint_hash: &[u8; 32], a: &RistrettoPoint) -> Scalar {
+    transcript_challenge_scalar(
+        domain,
+        &[
+            (b"role", TranscriptValue::U8(role)),
+            (b"identity", TranscriptValue::Bytes(identity)),
+            (b"pubkey", TranscriptValue::Point(pubkey)),
+            (b"peer_id", TranscriptValue::Bytes(peer_id)),
+            (b"issued_at", TranscriptValue::U64(issued_at)),
+            (b"expires_at", TranscriptValue::U64(expires_at)),
+            (b"continuity_counter", TranscriptValue::U64(continuity_counter)),
+            (b"reconnect_epoch", TranscriptValue::U64(reconnect_epoch)),
+            (b"prev_checkpoint_hash", TranscriptValue::Bytes(prev_checkpoint_hash)),
+            (b"state_hash", TranscriptValue::Bytes(state_hash)),
+            (b"checkpoint_hash", TranscriptValue::Bytes(checkpoint_hash)),
+            (b"a", TranscriptValue::Point(a)),
+        ],
+    )
+}
+
+fn server_identity_from_pub(p: &RistrettoPoint) -> [u8; 32] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, b"server-id-v1");
+    sha2::Digest::update(&mut h, p.compress().as_bytes());
+    let out = h.finalize();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out);
+    r
+}
+
+fn hash_server_continuity_state(server_identity: &[u8; 32], server_pub: &[u8; 32], registry: &HashMap<[u8; 32], RistrettoPoint>, continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    sha2::Digest::update(&mut h, b"server-state-v1");
+    sha2::Digest::update(&mut h, server_identity);
+    sha2::Digest::update(&mut h, server_pub);
+    sha2::Digest::update(&mut h, &continuity_counter.to_le_bytes());
+    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
+    sha2::Digest::update(&mut h, peer_id);
+    let mut entries: Vec<([u8;32],[u8;32])> = registry.iter().map(|(id,p)| (*id, p.compress().to_bytes())).collect();
+    entries.sort_by(|a,b| a.0.cmp(&b.0));
+    for (id, pk) in entries {
+        sha2::Digest::update(&mut h, &id);
+        sha2::Digest::update(&mut h, &pk);
+    }
+    let out = h.finalize();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out);
+    r
+}
+
+fn load_or_init_server_continuity_state(
+    server_static_pub: &RistrettoPoint,
+    registry: &HashMap<[u8; 32], RistrettoPoint>,
+    peer_id: &[u8; 32],
+) -> std::io::Result<ContinuityState> {
+    let server_identity = server_identity_from_pub(server_static_pub);
+    let pubkey = server_static_pub.compress().to_bytes();
+
+    if Path::new(SERVER_CONTINUITY_FILE).exists() {
+        verify_private_file_permissions(SERVER_CONTINUITY_FILE)?;
+        let st = ContinuityState::deserialize(&fs::read(SERVER_CONTINUITY_FILE)?)?;
+
+        if st.role == 2 && st.identity == server_identity && st.pubkey == pubkey {
+            return Ok(st);
+        }
+
+        eprintln!(
+            "Server[CONTINUITY]: existing continuity state does not match current server key; reinitializing"
+        );
+    }
+
+    let state_hash =
+        hash_server_continuity_state(&server_identity, &pubkey, registry, 0, 0, peer_id);
+
+    let st = ContinuityState {
+        version: 1,
+        role: 2,
+        identity: server_identity,
+        pubkey,
+        continuity_counter: 0,
+        reconnect_epoch: 0,
+        last_peer_id: *peer_id,
+        last_checkpoint_hash: [0u8; 32],
+        state_hash,
+    };
+
+    write_private_file_atomic(SERVER_CONTINUITY_FILE, &st.serialize())?;
+    Ok(st)
+}
+
+fn save_server_continuity_state(st: &ContinuityState) -> std::io::Result<()> { write_private_file_atomic(SERVER_CONTINUITY_FILE, &st.serialize()) }
+
+fn client_tracks_load() -> std::io::Result<HashMap<[u8;32], ContinuityState>> {
+    if !Path::new(CLIENT_CONTINUITY_TRACKS_BIN).exists() { return Ok(HashMap::new()); }
+    verify_private_file_permissions(CLIENT_CONTINUITY_TRACKS_BIN)?;
+    let data = fs::read(CLIENT_CONTINUITY_TRACKS_BIN)?;
+    if data.len() % 178 != 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "client continuity track store corrupt")); }
+    let mut out = HashMap::new();
+    for chunk in data.chunks_exact(178) {
+        let st = ContinuityState::deserialize(chunk)?;
+        out.insert(st.identity, st);
+    }
+    Ok(out)
+}
+
+fn client_tracks_save(m: &HashMap<[u8;32], ContinuityState>) -> std::io::Result<()> {
+    let mut keys: Vec<[u8;32]> = m.keys().copied().collect();
+    keys.sort();
+    let mut out = Vec::with_capacity(keys.len() * 178);
+    for k in keys { out.extend_from_slice(&m[&k].serialize()); }
+    write_private_file_atomic(CLIENT_CONTINUITY_TRACKS_BIN, &out)
+}
+
+fn build_server_continuity_proof(output_path: &str, server_static_secret: &Scalar, server_static_pub: &RistrettoPoint, registry: &HashMap<[u8;32], RistrettoPoint>, peer_id: [u8;32], expires_in: u64) -> std::io::Result<()> {
+    if expires_in == 0 || expires_in > 300 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in must be between 1 and 300")); }
+    let mut st = load_or_init_server_continuity_state(server_static_pub, registry, &peer_id)?;
+    st.last_peer_id = peer_id;
+    st.continuity_counter = st.continuity_counter.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server continuity counter exhausted"))?;
+    st.reconnect_epoch = st.reconnect_epoch.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server reconnect epoch exhausted"))?;
+    st.state_hash = hash_server_continuity_state(&st.identity, &st.pubkey, registry, st.continuity_counter, st.reconnect_epoch, &peer_id);
+    let checkpoint_hash = next_checkpoint_hash(&st.last_checkpoint_hash, &st.state_hash, st.continuity_counter, st.reconnect_epoch, &peer_id);
+    let issued_at = unix_time_now()?;
+    let expires_at = issued_at.checked_add(expires_in).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "expires_at overflow"))?;
+    let r = random_scalar();
+    let a = RISTRETTO_BASEPOINT_POINT * r;
+    let c = continuity_challenge_scalar(T_SERVER_CONT, st.role, &st.identity, server_static_pub, &peer_id, issued_at, expires_at, st.continuity_counter, st.reconnect_epoch, &st.last_checkpoint_hash, &st.state_hash, &checkpoint_hash, &a);
+    let s = r + c * server_static_secret;
+    let proof = ContinuityProof { version:1, role: st.role, identity: st.identity, pubkey: st.pubkey, peer_id, issued_at, expires_at, continuity_counter: st.continuity_counter, reconnect_epoch: st.reconnect_epoch, prev_checkpoint_hash: st.last_checkpoint_hash, state_hash: st.state_hash, checkpoint_hash, a: a.compress().to_bytes(), s: s.to_bytes() };
+    st.last_checkpoint_hash = checkpoint_hash;
+    save_server_continuity_state(&st)?;
+    write_private_file_atomic(output_path, &proof.serialize())?;
+    println!("Server[CONTINUITY]: wrote server continuity proof to {} counter={} reconnect_epoch={} checkpoint_hash={}", output_path, st.continuity_counter, st.reconnect_epoch, hex::encode(proof.checkpoint_hash));
+    Ok(())
+}
+
+fn verify_client_continuity_proof(path: &str, reg: &HashMap<[u8;32], RistrettoPoint>) -> std::io::Result<()> {
+    let proof = ContinuityProof::deserialize(&fs::read(path)?)?;
+    if proof.role != 1 { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "proof is not a client continuity proof")); }
+    let expected_pub = reg.get(&proof.identity).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity identity is not enrolled"))?;
+    if expected_pub.compress().to_bytes().ct_eq(&proof.pubkey).unwrap_u8() == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity pubkey mismatch"));
+    }
+    let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
+    let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
+    let expected_peer_id = server_identity_from_pub(&server_static_pub);
+    if proof.peer_id != expected_peer_id {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity peer binding mismatch"));
+    }
+    let now = unix_time_now()?;
+    if proof.issued_at >= proof.expires_at || now < proof.issued_at || now > proof.expires_at {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity proof expired or not yet valid"));
+    }
+    let mut tracks = client_tracks_load()?;
+    let entry = tracks.entry(proof.identity).or_insert(ContinuityState {
+        version:1, role:1, identity:proof.identity, pubkey:proof.pubkey, continuity_counter:0, reconnect_epoch:0, last_peer_id:expected_peer_id, last_checkpoint_hash:[0u8;32], state_hash:[0u8;32],
+    });
+    if proof.continuity_counter <= entry.continuity_counter {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity replay detected"));
+    }
+    if proof.prev_checkpoint_hash != entry.last_checkpoint_hash {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity checkpoint chain mismatch"));
+    }
+    let recomputed_checkpoint = next_checkpoint_hash(&proof.prev_checkpoint_hash, &proof.state_hash, proof.continuity_counter, proof.reconnect_epoch, &proof.peer_id);
+    if recomputed_checkpoint != proof.checkpoint_hash {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity checkpoint hash mismatch"));
+    }
+    let a = CompressedRistretto(proof.a).decompress().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity A invalid"))?;
+    reject_identity(&a, "client continuity A")?;
+    let s: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.s)).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity s non-canonical"))?;
+    let c = continuity_challenge_scalar(T_CLIENT_CONT, proof.role, &proof.identity, expected_pub, &proof.peer_id, proof.issued_at, proof.expires_at, proof.continuity_counter, proof.reconnect_epoch, &proof.prev_checkpoint_hash, &proof.state_hash, &proof.checkpoint_hash, &a);
+    if RISTRETTO_BASEPOINT_POINT * s != a + (*expected_pub * c) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity Schnorr proof invalid"));
+    }
+    entry.continuity_counter = proof.continuity_counter;
+    entry.reconnect_epoch = proof.reconnect_epoch;
+    entry.last_checkpoint_hash = proof.checkpoint_hash;
+    entry.state_hash = proof.state_hash;
+    client_tracks_save(&tracks)?;
+    println!("Server[CONTINUITY]: verified returning client continuity proof file={} device_id={} counter={} reconnect_epoch={}", path, hex::encode(proof.identity), proof.continuity_counter, proof.reconnect_epoch);
+    Ok(())
+}
 
 fn handle_setup(
     stream: &mut TcpStream,
@@ -1285,6 +1864,13 @@ fn main() -> std::io::Result<()> {
     let mut pairing_token: Option<String> = None;
     let mut pairing_seconds: Option<u64> = None;
     let mut print_pubkey = false;
+    let mut verify_offline_path: Option<String> = None;
+    let mut make_server_continuity_path: Option<String> = None;
+    let mut verify_client_continuity_path: Option<String> = None;
+    let mut continuity_peer_id: Option<[u8;32]> = None;
+    let mut continuity_expires_in: u64 = 300;
+    let mut offline_audience: Option<String> = None;
+    let mut offline_scopes: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -1306,8 +1892,43 @@ fn main() -> std::io::Result<()> {
                 i += 2;
             }
             "--print-pubkey" => { print_pubkey = true; i += 1; }
+            "--verify-offline-proof" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-offline-proof missing value")); }
+                verify_offline_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--make-server-continuity-proof" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-server-continuity-proof missing value")); }
+                make_server_continuity_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--verify-client-continuity-proof" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-client-continuity-proof missing value")); }
+                verify_client_continuity_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--audience" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--audience missing value")); }
+                offline_audience = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--peer-id" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--peer-id missing value")); }
+                continuity_peer_id = Some(parse_hash32_hex(&args[i + 1])?);
+                i += 2;
+            }
+            "--continuity-expires-in" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in missing value")); }
+                continuity_expires_in = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --continuity-expires-in"))?;
+                i += 2;
+            }
+            "--allow-offline-scope" => {
+                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--allow-offline-scope missing value")); }
+                offline_scopes.push(args[i + 1].clone());
+                i += 2;
+            }
             _ => {
-                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey]", prog);
+                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey] [--verify-offline-proof FILE --audience NAME --allow-offline-scope SCOPE ...] [--make-server-continuity-proof FILE --peer-id HEX32 [--continuity-expires-in 300]] [--verify-client-continuity-proof FILE]", prog);
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown argument: {}", args[i])));
             }
         }
@@ -1340,6 +1961,28 @@ fn main() -> std::io::Result<()> {
     let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
     let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
+
+    if let Some(proof_path) = verify_offline_path.as_deref() {
+        let audience = offline_audience.as_deref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-offline-proof requires --audience")
+        })?;
+        if offline_scopes.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--verify-offline-proof requires at least one --allow-offline-scope",
+            ));
+        }
+        let allowed_scopes: HashSet<String> = offline_scopes.into_iter().collect();
+        let mut counters = OfflineCounterStore::load(OFFLINE_COUNTERS_BIN).unwrap_or_default();
+        return verify_offline_proof(proof_path, audience, &allowed_scopes, &reg_map, &mut counters);
+    }
+    if let Some(path) = verify_client_continuity_path.as_deref() {
+        return verify_client_continuity_proof(path, &reg_map);
+    }
+    if let Some(path) = make_server_continuity_path.as_deref() {
+        let peer_id = continuity_peer_id.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-server-continuity-proof requires --peer-id"))?;
+        return build_server_continuity_proof(path, &server_static_secret, &server_static_pub, &reg_map, peer_id, continuity_expires_in);
+    }
     let reg = Arc::new(RwLock::new(reg_map));
     let replay_state = ReplayCache::load(REPLAY_CACHE_BIN).unwrap_or_default();
     let replay = Arc::new(Mutex::new(replay_state));

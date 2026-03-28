@@ -22,6 +22,16 @@ SERVER_PUB_HEX_FILE="${SERVER_STATE_DIR}/server_pub.hex"
 SERVER_REGISTRY="${SERVER_STATE_DIR}/registry.bin"
 SERVER_REGISTRY_BAK="${SERVER_STATE_DIR}/registry.bak"
 SERVER_REPLAY_CACHE="${SERVER_STATE_DIR}/replay_cache.bin"
+SERVER_OFFLINE_COUNTERS="${SERVER_STATE_DIR}/offline_counters.bin"
+
+OFFLINE_PROOF_FILE="${GENERATED_DIR}/offline_proof.bin"
+OFFLINE_REQUEST_FILE="${GENERATED_DIR}/offline_request.bin"
+DEFAULT_OFFLINE_AUDIENCE="gateway-A"
+DEFAULT_OFFLINE_SCOPE="telemetry_upload"
+DEFAULT_OFFLINE_EXPIRES_IN=120
+CLIENT_CONTINUITY_PROOF_FILE="${GENERATED_DIR}/client_continuity_proof.bin"
+SERVER_CONTINUITY_PROOF_FILE="${GENERATED_DIR}/server_continuity_proof.bin"
+DEFAULT_CONTINUITY_EXPIRES_IN=300
 
 SERVER_CERT="${SERVER_STATE_DIR}/server_cert.pem"
 SERVER_CERT_KEY="${SERVER_STATE_DIR}/server_cert_key.pem"
@@ -398,10 +408,20 @@ ${_C}SERVER COMMANDS${_N}
 ${_C}CLIENT COMMANDS${_N}
   setup-device <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
   auth-device <server_ip:port>
+  make-offline-proof [--output <file>] [--audience <name>] [--scope <scope>] [--expires-in <1..300>] [--request-file <path>|--request-text <text>|--request-hash <hex>]
   show-pinned-key
   pin-server <server_pub_hex>
+  make-client-continuity-proof [--output <file>] [--expires-in <1..300>]
+  verify-server-continuity-proof [--proof <file>]
   reset-client
   status
+
+${_C}OFFLINE TEST COMMANDS${_N}
+  verify-offline-proof [--proof <file>] [--audience <name>] [--allow-scope <scope>]...
+  offline-local [--audience <name>] [--scope <scope>] [--expires-in <1..300>] [--request-file <path>|--request-text <text>|--request-hash <hex>]
+  make-server-continuity-proof --peer-id <client_device_id_hex> [--output <file>] [--expires-in <1..300>]
+  verify-client-continuity-proof [--proof <file>]
+  continuity-local [--expires-in <1..300>]
 
 ${_C}COMBINED FLOWS${_N}
   client-local <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
@@ -414,6 +434,8 @@ ${_C}RECOMMENDED LOCAL TEST FLOW${_N}
   ./zk-arche.sh make-certs
   sudo ./zk-arche.sh server-local 127.0.0.1:4000
   sudo ./zk-arche.sh client-local 127.0.0.1:4000
+  ./zk-arche.sh offline-local --request-text "cached telemetry payload"
+  ./zk-arche.sh continuity-local
 
 EOF2
 }
@@ -452,6 +474,7 @@ cmd_check_server_certs() {
   _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_REGISTRY" "device registry"
   _status_file "$SERVER_REPLAY_CACHE" "replay cache"
+  _status_file "$SERVER_OFFLINE_COUNTERS" "offline counter store"
   _status_file "$SERVER_PUB_HEX_FILE" "server pub hex"
 }
 
@@ -626,6 +649,7 @@ cmd_status() {
   _status_file "$SERVER_REGISTRY" "device registry"
   _status_file "$SERVER_REGISTRY_BAK" "device registry backup"
   _status_file "$SERVER_REPLAY_CACHE" "replay cache"
+  _status_file "$SERVER_OFFLINE_COUNTERS" "offline counter store"
   _status_file "$SERVER_SK_FILE" "server static key"
   _status_file "$SERVER_CA_CERT" "ca cert"
   if sudo test -f "$SERVER_CA_KEY"; then
@@ -676,6 +700,10 @@ cmd_status() {
   if [[ -f "$DEVICE_CSR" ]]; then _status_file "$DEVICE_CSR" "device csr"; else log_warn "device csr: absent"; fi
   if [[ -f "$CA_SERIAL" ]]; then _status_file "$CA_SERIAL" "ca serial"; else log_warn "ca serial: absent"; fi
   if [[ -f "$OPENSSL_EXT" ]]; then _status_file "$OPENSSL_EXT" "openssl ext config"; else log_ok "openssl ext config: absent (cleaned up — good)"; fi
+  if [[ -f "$OFFLINE_PROOF_FILE" ]]; then _status_file "$OFFLINE_PROOF_FILE" "offline proof artifact"; else log_warn "offline proof artifact: absent"; fi
+  if [[ -f "$OFFLINE_REQUEST_FILE" ]]; then _status_file "$OFFLINE_REQUEST_FILE" "offline request sample"; else log_warn "offline request sample: absent"; fi
+  if [[ -f "$CLIENT_CONTINUITY_PROOF_FILE" ]]; then _status_file "$CLIENT_CONTINUITY_PROOF_FILE" "client continuity proof"; else log_warn "client continuity proof: absent"; fi
+  if [[ -f "$SERVER_CONTINUITY_PROOF_FILE" ]]; then _status_file "$SERVER_CONTINUITY_PROOF_FILE" "server continuity proof"; else log_warn "server continuity proof: absent"; fi
 }
 
 cmd_client_local() {
@@ -723,9 +751,263 @@ cmd_full_device_onboard() {
   cmd_setup_device "${setup_args[@]}"
 }
 
+cmd_make_offline_proof() {
+  require_bin "$CLIENT_BIN"
+  ensure_existing_client_material
+
+  local output="$OFFLINE_PROOF_FILE"
+  local audience="$DEFAULT_OFFLINE_AUDIENCE"
+  local scope="$DEFAULT_OFFLINE_SCOPE"
+  local expires_in="$DEFAULT_OFFLINE_EXPIRES_IN"
+  local request_file=""
+  local request_text=""
+  local request_hash=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output)
+        [[ $# -ge 2 ]] || die "--output requires a value"
+        output="$2"; shift 2 ;;&
+      --audience)
+        [[ $# -ge 2 ]] || die "--audience requires a value"
+        audience="$2"; shift 2 ;;&
+      --scope)
+        [[ $# -ge 2 ]] || die "--scope requires a value"
+        scope="$2"; shift 2 ;;&
+      --expires-in)
+        [[ $# -ge 2 ]] || die "--expires-in requires a value"
+        expires_in="$2"; shift 2 ;;&
+      --request-file)
+        [[ $# -ge 2 ]] || die "--request-file requires a value"
+        request_file="$2"; shift 2 ;;&
+      --request-text)
+        [[ $# -ge 2 ]] || die "--request-text requires a value"
+        request_text="$2"; shift 2 ;;&
+      --request-hash)
+        [[ $# -ge 2 ]] || die "--request-hash requires a value"
+        request_hash="$2"; shift 2 ;;&
+      *) die "make-offline-proof: unknown option: $1" ;;&
+    esac
+  done
+
+  local req_args=()
+  if [[ -n "$request_file" ]]; then
+    [[ -f "$request_file" ]] || die "Request file not found: $request_file"
+    req_args=(--request-file "$request_file")
+  elif [[ -n "$request_text" ]]; then
+    ensure_state_dirs
+    printf '%s' "$request_text" > "$OFFLINE_REQUEST_FILE"
+    chmod 600 "$OFFLINE_REQUEST_FILE" 2>/dev/null || true
+    req_args=(--request-file "$OFFLINE_REQUEST_FILE")
+  elif [[ -n "$request_hash" ]]; then
+    validate_hex32 "$request_hash" "request_hash"
+    req_args=(--request-hash "$request_hash")
+  else
+    ensure_state_dirs
+    printf '%s' 'offline fallback request' > "$OFFLINE_REQUEST_FILE"
+    chmod 600 "$OFFLINE_REQUEST_FILE" 2>/dev/null || true
+    req_args=(--request-file "$OFFLINE_REQUEST_FILE")
+  fi
+
+  mkdir -p "$(dirname "$output")"
+
+  log_header "Build offline proof artifact"
+  log_info "Output: $output"
+  log_info "Audience: $audience"
+  log_info "Scope: $scope"
+  log_info "Expires in: ${expires_in}s"
+
+  sudo "$CLIENT_BIN" \
+    --make-offline-proof "$output" \
+    --audience "$audience" \
+    --scope "$scope" \
+    --offline-expires-in "$expires_in" \
+    "${req_args[@]}"
+
+  log_ok "Offline proof written: $output"
+}
+
+cmd_verify_offline_proof() {
+  require_bin "$SERVER_BIN"
+  ensure_existing_server_material
+
+  local proof="$OFFLINE_PROOF_FILE"
+  local audience="$DEFAULT_OFFLINE_AUDIENCE"
+  local scopes=("$DEFAULT_OFFLINE_SCOPE")
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proof)
+        [[ $# -ge 2 ]] || die "--proof requires a value"
+        proof="$2"; shift 2 ;;&
+      --audience)
+        [[ $# -ge 2 ]] || die "--audience requires a value"
+        audience="$2"; shift 2 ;;&
+      --allow-scope|--allow-offline-scope)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        scopes+=("$2"); shift 2 ;;&
+      *) die "verify-offline-proof: unknown option: $1" ;;&
+    esac
+  done
+
+  [[ -f "$proof" ]] || die "Offline proof file not found: $proof"
+
+  local allow_args=()
+  local uniq_scopes
+  mapfile -t uniq_scopes < <(printf '%s
+' "${scopes[@]}" | awk 'NF && !seen[$0]++')
+  for s in "${uniq_scopes[@]}"; do
+    allow_args+=(--allow-offline-scope "$s")
+  done
+
+  log_header "Verify offline proof artifact"
+  log_info "Proof: $proof"
+  log_info "Audience: $audience"
+  log_info "Allowed scopes: ${uniq_scopes[*]}"
+
+  (cd "$SERVER_STATE_DIR" && sudo "$SERVER_BIN" --verify-offline-proof "$proof" --audience "$audience" "${allow_args[@]}")
+
+  log_ok "Offline proof verification succeeded"
+}
+
+cmd_offline_local() {
+  local mk_args=()
+  local verify_args=()
+  local output="$OFFLINE_PROOF_FILE"
+  local audience="$DEFAULT_OFFLINE_AUDIENCE"
+  local scope="$DEFAULT_OFFLINE_SCOPE"
+  local expires_in="$DEFAULT_OFFLINE_EXPIRES_IN"
+  local request_mode=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;&
+      --audience) [[ $# -ge 2 ]] || die "--audience requires a value"; audience="$2"; shift 2 ;;&
+      --scope) [[ $# -ge 2 ]] || die "--scope requires a value"; scope="$2"; shift 2 ;;&
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;&
+      --request-file|--request-text|--request-hash)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        request_mode=("$1" "$2"); shift 2 ;;&
+      *) die "offline-local: unknown option: $1" ;;&
+    esac
+  done
+
+  mk_args=(--output "$output" --audience "$audience" --scope "$scope" --expires-in "$expires_in")
+  if [[ ${#request_mode[@]} -gt 0 ]]; then
+    mk_args+=("${request_mode[@]}")
+  fi
+  verify_args=(--proof "$output" --audience "$audience" --allow-scope "$scope")
+
+  log_header "Offline fallback local test"
+  cmd_make_offline_proof "${mk_args[@]}"
+  cmd_verify_offline_proof "${verify_args[@]}"
+}
+
+
+cmd_make_client_continuity_proof() {
+  require_bin "$CLIENT_BIN"
+  ensure_existing_client_material
+  local output="$CLIENT_CONTINUITY_PROOF_FILE"
+  local expires_in="$DEFAULT_CONTINUITY_EXPIRES_IN"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      *) die "make-client-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  mkdir -p "$(dirname "$output")"
+  log_header "Build client continuity proof"
+  log_info "Output: $output"
+  log_info "Expires in: ${expires_in}s"
+  sudo "$CLIENT_BIN" --make-client-continuity-proof "$output" --continuity-expires-in "$expires_in"
+  log_ok "Client continuity proof written: $output"
+}
+
+cmd_verify_server_continuity_proof() {
+  require_bin "$CLIENT_BIN"
+  ensure_existing_client_material
+  local proof="$SERVER_CONTINUITY_PROOF_FILE"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proof) [[ $# -ge 2 ]] || die "--proof requires a value"; proof="$2"; shift 2 ;;
+      *) die "verify-server-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  [[ -f "$proof" ]] || die "Server continuity proof file not found: $proof"
+  log_header "Verify server continuity proof"
+  log_info "Proof: $proof"
+  sudo "$CLIENT_BIN" --verify-server-continuity-proof "$proof"
+  log_ok "Server continuity proof verification succeeded"
+}
+
+cmd_make_server_continuity_proof() {
+  require_bin "$SERVER_BIN"
+  ensure_existing_server_material
+  local output="$SERVER_CONTINUITY_PROOF_FILE"
+  local expires_in="$DEFAULT_CONTINUITY_EXPIRES_IN"
+  local peer_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      --peer-id) [[ $# -ge 2 ]] || die "--peer-id requires a value"; peer_id="$2"; shift 2 ;;
+      *) die "make-server-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$peer_id" ]] || die "make-server-continuity-proof requires --peer-id <client_device_id_hex>"
+  validate_hex32 "$peer_id" "peer-id"
+  mkdir -p "$(dirname "$output")"
+  log_header "Build server continuity proof"
+  log_info "Output: $output"
+  log_info "Peer id: $peer_id"
+  log_info "Expires in: ${expires_in}s"
+  (cd "$SERVER_STATE_DIR" && sudo "$SERVER_BIN" --make-server-continuity-proof "$output" --peer-id "$peer_id" --continuity-expires-in "$expires_in")
+  log_ok "Server continuity proof written: $output"
+}
+
+cmd_verify_client_continuity_proof() {
+  require_bin "$SERVER_BIN"
+  ensure_existing_server_material
+  local proof="$CLIENT_CONTINUITY_PROOF_FILE"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --proof) [[ $# -ge 2 ]] || die "--proof requires a value"; proof="$2"; shift 2 ;;
+      *) die "verify-client-continuity-proof: unknown option: $1" ;;
+    esac
+  done
+  [[ -f "$proof" ]] || die "Client continuity proof file not found: $proof"
+  log_header "Verify client continuity proof"
+  log_info "Proof: $proof"
+  (cd "$SERVER_STATE_DIR" && sudo "$SERVER_BIN" --verify-client-continuity-proof "$proof")
+  log_ok "Client continuity proof verification succeeded"
+}
+
+cmd_continuity_local() {
+  local expires_in="$DEFAULT_CONTINUITY_EXPIRES_IN"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --expires-in) [[ $# -ge 2 ]] || die "--expires-in requires a value"; expires_in="$2"; shift 2 ;;
+      *) die "continuity-local: unknown option: $1" ;;
+    esac
+  done
+  ensure_existing_demo_material
+  local derived did dpub
+  derived="$(derive_client_identity_hex 2>/dev/null || true)"
+  did="$(awk '{print $1}' <<<"$derived")"
+  [[ -n "$did" ]] || die "Could not derive client device_id; make sure client state exists"
+
+  log_header "Continuity local test"
+  cmd_make_client_continuity_proof --output "$CLIENT_CONTINUITY_PROOF_FILE" --expires-in "$expires_in"
+  cmd_verify_client_continuity_proof --proof "$CLIENT_CONTINUITY_PROOF_FILE"
+  cmd_make_server_continuity_proof --output "$SERVER_CONTINUITY_PROOF_FILE" --peer-id "$did" --expires-in "$expires_in"
+  cmd_verify_server_continuity_proof --proof "$SERVER_CONTINUITY_PROOF_FILE"
+}
+
 cmd_reset_client() {
   log_warn "Resetting client state: $CLIENT_STATE_DIR"
   sudo rm -rf "$CLIENT_STATE_DIR"
+  rm -f "$OFFLINE_PROOF_FILE" "$OFFLINE_REQUEST_FILE" "$CLIENT_CONTINUITY_PROOF_FILE" "$SERVER_CONTINUITY_PROOF_FILE"
   sudo mkdir -p "$CLIENT_STATE_DIR"
   sudo chmod 700 "$CLIENT_STATE_DIR"
   log_ok "Client state removed"
@@ -741,9 +1023,11 @@ cmd_reset_server() {
              "$SERVER_PUB_HEX_FILE" \
              "$SERVER_CERT" "$SERVER_CERT_KEY" \
              "$SERVER_CA_CERT" "$SERVER_CA_KEY" \
+             "$SERVER_OFFLINE_COUNTERS" \
              "${SERVER_STATE_DIR}/ca_cert.srl"
   rm -f "$GEN_DEVICE_CERT" "$GEN_DEVICE_KEY" \
         "$SERVER_CSR" "$DEVICE_CSR" "$CA_SERIAL" "$OPENSSL_EXT" \
+        "$OFFLINE_PROOF_FILE" "$OFFLINE_REQUEST_FILE" "$CLIENT_CONTINUITY_PROOF_FILE" "$SERVER_CONTINUITY_PROOF_FILE" \
         "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN"
   log_ok "Server state removed"
 }
@@ -773,6 +1057,14 @@ main() {
     pin-server) cmd_pin_server "$@" ;;
     setup-device) cmd_setup_device "$@" ;;
     auth-device) cmd_auth_device "$@" ;;
+    make-offline-proof) cmd_make_offline_proof "$@" ;;
+    verify-offline-proof) cmd_verify_offline_proof "$@" ;;
+    offline-local) cmd_offline_local "$@" ;;
+    make-client-continuity-proof) cmd_make_client_continuity_proof "$@" ;;
+    verify-server-continuity-proof) cmd_verify_server_continuity_proof "$@" ;;
+    make-server-continuity-proof) cmd_make_server_continuity_proof "$@" ;;
+    verify-client-continuity-proof) cmd_verify_client_continuity_proof "$@" ;;
+    continuity-local) cmd_continuity_local "$@" ;;
     show-pinned-key) cmd_show_pinned_key "$@" ;;
     status) cmd_status "$@" ;;
     client-local) cmd_client_local "$@" ;;
