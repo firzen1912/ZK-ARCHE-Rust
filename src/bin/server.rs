@@ -27,12 +27,6 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
 
-use openssl::pkey::{Id as PKeyId, PKey, Private, Public};
-use openssl::sign::{Signer, Verifier};
-use openssl::stack::Stack;
-use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::{X509StoreContext, X509, X509NameRef};
-
 type HmacSha256 = Hmac<Sha256>;
 
 const MSG_SETUP: u8 = 0x01;
@@ -45,16 +39,12 @@ const REGISTRY_BIN: &str = "/var/lib/iot-auth/server/registry.bin";
 const REGISTRY_BAK: &str = "/var/lib/iot-auth/server/registry.bak";
 const REPLAY_CACHE_BIN: &str = "/var/lib/iot-auth/server/replay_cache.bin";
 const SERVER_SK_FILE: &str = "/var/lib/iot-auth/server/server_sk.bin";
-const SERVER_CERT_FILE: &str = "/var/lib/iot-auth/server/server_cert.pem";
-const SERVER_CERT_KEY_FILE: &str = "/var/lib/iot-auth/server/server_cert_key.pem";
-const CA_CERT_FILE: &str = "/var/lib/iot-auth/server/ca_cert.pem";
 const OFFLINE_COUNTERS_BIN: &str = "/var/lib/iot-auth/server/offline_counters.bin";
 const SERVER_CONTINUITY_FILE: &str = "/var/lib/iot-auth/server/continuity.bin";
 const CLIENT_CONTINUITY_TRACKS_BIN: &str = "/var/lib/iot-auth/server/client_continuity_tracks.bin";
-const MAX_CERT_FILE_SIZE: usize = 128 * 1024;
-const MAX_SIG_SIZE: usize = 8192;
 
-const T_SETUP: &[u8] = b"setup_schnorr_v1";
+const T_SETUP: &[u8] = b"setup_client_schnorr_v1";
+const T_SETUP_SERVER: &[u8] = b"setup_server_schnorr_v1";
 const T_CLIENT: &[u8] = b"client_schnorr_v1";
 const T_SERVER: &[u8] = b"server_schnorr_v1";
 const T_KC: &[u8] = b"kc_v1";
@@ -75,11 +65,6 @@ const MAX_OFFLINE_FIELD: usize = 256;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_BAN: Duration = Duration::from_secs(120);
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
-const CERT_MAX_VALIDITY_DAYS: i32 = 30;
-const EKU_TLS_CLIENT_AUTH: &str = "TLS Web Client Authentication";
-const EKU_TLS_SERVER_AUTH: &str = "TLS Web Server Authentication";
-const DEVICE_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.1";
-const SERVER_IDENTITY_OID: &str = "1.3.6.1.4.1.55555.1.2";
 
 /// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
 struct NonceCounter {
@@ -134,7 +119,6 @@ impl CompatTranscript {
         Scalar::from_bytes_mod_order_wide(&wide)
     }
 }
-
 
 #[derive(Clone, Copy)]
 /// Wraps the supported value types that can be appended into a compatibility transcript.
@@ -194,10 +178,12 @@ fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Verifies the client setup proof against the presented device public key and server nonce.
+/// Verifies the client setup proof against the presented device public key and server static key.
 fn schnorr_verify_setup(
     pubkey: &RistrettoPoint,
     device_id: &[u8; 32],
+    server_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
     a: &RistrettoPoint,
     s: &Scalar,
@@ -205,13 +191,43 @@ fn schnorr_verify_setup(
     let c = transcript_challenge_scalar(
         T_SETUP,
         &[
+            (b"role", TranscriptValue::Bytes(b"client")),
             (b"device_id", TranscriptValue::Bytes(device_id)),
-            (b"pubkey", TranscriptValue::Point(pubkey)),
+            (b"device_pub", TranscriptValue::Point(pubkey)),
+            (b"server_pub", TranscriptValue::Point(server_static_pub)),
             (b"a", TranscriptValue::Point(a)),
+            (b"client_nonce", TranscriptValue::Bytes(client_nonce)),
             (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
         ],
     );
     RISTRETTO_BASEPOINT_POINT * s == a + pubkey * c
+}
+
+/// Creates the server setup proof for raw-public-key enrollment.
+fn schnorr_prove_setup_server(
+    server_secret: &Scalar,
+    server_static_pub: &RistrettoPoint,
+    device_id: &[u8; 32],
+    device_static_pub: &RistrettoPoint,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> (RistrettoPoint, Scalar) {
+    let r = random_scalar();
+    let a = RISTRETTO_BASEPOINT_POINT * r;
+    let c = transcript_challenge_scalar(
+        T_SETUP_SERVER,
+        &[
+            (b"role", TranscriptValue::Bytes(b"server")),
+            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"device_pub", TranscriptValue::Point(device_static_pub)),
+            (b"server_pub", TranscriptValue::Point(server_static_pub)),
+            (b"a", TranscriptValue::Point(&a)),
+            (b"client_nonce", TranscriptValue::Bytes(client_nonce)),
+            (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
+        ],
+    );
+    let s = r + c * server_secret;
+    (a, s)
 }
 
 /// Verifies the client online-authentication Schnorr proof against the registered device key.
@@ -515,137 +531,11 @@ fn verify_private_file_permissions(_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Reads a file from disk and rejects oversized inputs.
-fn read_file_all(path: &str, max_len: usize) -> std::io::Result<Vec<u8>> {
-    let data = fs::read(path)?;
-    if data.len() > max_len {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path} exceeds max size")));
-    }
-    Ok(data)
-}
-
-/// Parses an X.509 certificate from PEM or DER input.
-fn load_cert_from_bytes(buf: &[u8]) -> std::io::Result<X509> {
-    X509::from_pem(buf)
-        .or_else(|_| X509::from_der(buf))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("X509 parse failed: {e}")))
-}
-
-/// Parses a private key from PEM or DER input.
-fn load_private_key_from_bytes(buf: &[u8]) -> std::io::Result<PKey<Private>> {
-    PKey::private_key_from_pem(buf)
-        .or_else(|_| PKey::private_key_from_der(buf))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("private key parse failed: {e}")))
-}
-
-/// Validates a certificate chain, validity interval, and short-lived policy against the configured CA.
-fn verify_cert_against_ca(cert: &X509, ca_cert: &X509) -> std::io::Result<()> {
-    let now = openssl::asn1::Asn1Time::days_from_now(0)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("time init failed: {e}")))?;
-    if cert.not_before().compare(&now)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not_before compare failed: {e}")))?
-        .is_gt()
-    {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate is not yet valid"));
-    }
-    if cert.not_after().compare(&now)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not_after compare failed: {e}")))?
-        .is_lt()
-    {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate has expired"));
-    }
-
-    let mut store_builder = X509StoreBuilder::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("store builder failed: {e}")))?;
-    store_builder
-        .add_cert(ca_cert.to_owned())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("add CA cert failed: {e}")))?;
-    let store = store_builder.build();
-    let chain = Stack::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chain init failed: {e}")))?;
-    let mut ctx = X509StoreContext::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("store context failed: {e}")))?;
-    let ok = ctx
-        .init(&store, cert, &chain, |c| c.verify_cert())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate path validation failed: {e}")))?;
-    if !ok {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "certificate not issued by trusted CA"));
-    }
-    enforce_short_lived_cert(cert)?;
-    Ok(())
-}
-
-/// Reads a subject field from a certificate and returns it as lowercase UTF-8 text.
-fn cert_subject_field_hex(cert: &X509, nid: openssl::nid::Nid) -> std::io::Result<String> {
-    let name: &X509NameRef = cert.subject_name();
-    let entry = name.entries_by_nid(nid).next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("missing subject field {nid:?}")))?;
-    let data = entry.data().as_utf8().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("subject field utf8 failed: {e}")))?;
-    Ok(data.to_string().to_ascii_lowercase())
-}
-
-/// Signs a 32-byte transcript hash using the configured certificate private key.
-fn sign_transcript_hash(pkey: &PKey<Private>, th: &[u8; 32]) -> std::io::Result<Vec<u8>> {
-    let mut signer = if matches!(pkey.id(), PKeyId::ED25519 | PKeyId::ED448) {
-        Signer::new_without_digest(pkey)
-    } else {
-        Signer::new(openssl::hash::MessageDigest::sha256(), pkey)
-    }.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("sign init failed: {e}")))?;
-    signer.sign_oneshot_to_vec(th)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("sign failed: {e}")))
-}
-
-/// Verifies a transcript-hash signature using the peer certificate public key.
-fn verify_transcript_hash_sig(pkey: &PKey<Public>, th: &[u8; 32], sig: &[u8]) -> std::io::Result<()> {
-    let mut verifier = if matches!(pkey.id(), PKeyId::ED25519 | PKeyId::ED448) {
-        Verifier::new_without_digest(pkey)
-    } else {
-        Verifier::new(openssl::hash::MessageDigest::sha256(), pkey)
-    }.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("verify init failed: {e}")))?;
-    let ok = verifier.verify_oneshot(sig, th)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("verify failed: {e}")))?;
-    if ok { Ok(()) } else { Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "signature verification failed")) }
-}
-
 /// Sends a length-prefixed binary blob.
 fn send_blob(stream: &mut impl Write, buf: &[u8], sent: &mut usize) -> std::io::Result<()> {
     send_all(stream, &(buf.len() as u32).to_le_bytes(), sent)?;
     if !buf.is_empty() { send_all(stream, buf, sent)?; }
     Ok(())
-}
-
-/// Receives a length-prefixed binary blob with a caller-supplied maximum length.
-fn recv_blob(stream: &mut impl Read, max_len: usize, recv: &mut usize) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    recv_exact(stream, &mut len_buf, recv)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > max_len { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("blob too large: {len}"))); }
-    let mut buf = vec![0u8; len];
-    if len > 0 { recv_exact(stream, &mut buf, recv)?; }
-    Ok(buf)
-}
-
-/// Builds the transcript hash for the mutual-certificate zero-touch provisioning exchange.
-fn ztp_cert_transcript_hash(
-    device_id: &[u8; 32],
-    device_pub: &[u8; 32],
-    client_nonce: &[u8; 32],
-    server_nonce: &[u8; 32],
-    device_cert: &[u8],
-    server_cert: &[u8],
-) -> [u8; 32] {
-    let dev_hash = Sha256::digest(device_cert);
-    let srv_hash = Sha256::digest(server_cert);
-    let mut t = CompatTranscript::new(b"ztp-mutual-cert-v1");
-    t.append_message(b"device_id", device_id);
-    t.append_message(b"device_pub", device_pub);
-    t.append_message(b"client_nonce", client_nonce);
-    t.append_message(b"server_nonce", server_nonce);
-    t.append_message(b"device_cert_hash", &dev_hash);
-    t.append_message(b"server_cert_hash", &srv_hash);
-    let out = Sha256::digest(&t.buf);
-    let mut th = [0u8; 32];
-    th.copy_from_slice(&out);
-    th
 }
 
 /// Creates the parent directory for a state file when it does not already exist.
@@ -801,7 +691,6 @@ impl PairingPolicy {
     }
 }
 
-
 struct ServerSession {
     stream: TcpStream,
     cipher_tx: ChaCha20Poly1305,
@@ -833,7 +722,6 @@ impl ServerSession {
         Ok(pt)
     }
 }
-
 
 #[derive(Clone)]
 /// Tracks recent failures for one peer so the server can rate-limit abusive sources.
@@ -914,62 +802,6 @@ impl Drop for ActiveConnGuard {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
-
-/// Extracts the OpenSSL textual representation of a certificate for extension checks.
-fn cert_text(cert: &X509) -> std::io::Result<String> {
-    let text = cert
-        .to_text()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text extraction failed: {e}")))?;
-    String::from_utf8(text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate text utf8 failed: {e}")))
-}
-
-/// Rejects certificates whose validity window exceeds the configured maximum lifetime.
-fn enforce_short_lived_cert(cert: &X509) -> std::io::Result<()> {
-    let diff = cert.not_after()
-        .diff(cert.not_before())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("certificate validity diff failed: {e}")))?;
-    if diff.days > CERT_MAX_VALIDITY_DAYS || (diff.days == CERT_MAX_VALIDITY_DAYS && diff.secs > 0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("certificate validity exceeds {} days", CERT_MAX_VALIDITY_DAYS),
-        ));
-    }
-    Ok(())
-}
-
-/// Checks that the certificate contains the expected Extended Key Usage value.
-fn require_eku(cert: &X509, required_eku: &str) -> std::io::Result<()> {
-    let text = cert_text(cert)?;
-    let has_eku_section = text.contains("Extended Key Usage");
-    if !has_eku_section || !text.contains(required_eku) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("certificate missing required EKU: {required_eku}"),
-        ));
-    }
-    Ok(())
-}
-
-/// Checks that the custom identity extension is present and matches the expected hex-encoded identity.
-fn require_custom_identity_extension(cert: &X509, oid: &str, expected_hex: &str) -> std::io::Result<()> {
-    let text = cert_text(cert)?;
-    let oid_pos = text.find(oid).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("certificate missing custom identity extension {oid}"),
-        )
-    })?;
-    let tail = &text[oid_pos..];
-    if !tail.to_ascii_lowercase().contains(&expected_hex.to_ascii_lowercase()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("certificate custom identity extension {oid} mismatch"),
-        ));
-    }
-    Ok(())
-}
-
-
 
 #[derive(Debug, Clone)]
 /// Represents a serialized offline authorization proof and its metadata.
@@ -1183,7 +1015,6 @@ fn verify_offline_proof(
     );
     Ok(())
 }
-
 
 #[derive(Clone, Debug)]
 /// Stores continuity-tracking state that links one successful session to the next.
@@ -1541,12 +1372,9 @@ fn verify_client_continuity_proof(path: &str, reg: &HashMap<[u8;32], RistrettoPo
 fn handle_setup(
     stream: &mut TcpStream,
     policy: &PairingPolicy,
+    server_static_secret: &Scalar,
     server_static_pub: &RistrettoPoint,
     reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    server_cert_buf: &[u8],
-    server_cert: &X509,
-    server_cert_key: &PKey<Private>,
-    ca_cert: &X509,
     sent: &mut usize,
     recv: &mut usize,
     failures: &Arc<Mutex<FailureTracker>>,
@@ -1566,20 +1394,6 @@ fn handle_setup(
     let device_pub_bytes = device_static_pub.compress().to_bytes();
     let mut client_nonce = [0u8; 32];
     recv_exact(stream, &mut client_nonce, recv)?;
-    let device_cert_buf = recv_blob(stream, MAX_CERT_FILE_SIZE, recv)?;
-    let device_cert = load_cert_from_bytes(&device_cert_buf)?;
-    verify_cert_against_ca(&device_cert, ca_cert)?;
-
-    let expected_cn = hex::encode(device_id);
-    let expected_ou = hex::encode(device_pub_bytes);
-    require_eku(&device_cert, EKU_TLS_CLIENT_AUTH)?;
-    require_custom_identity_extension(&device_cert, DEVICE_IDENTITY_OID, &expected_cn)?;
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::COMMONNAME)? != expected_cn {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate CN mismatch"));
-    }
-    if cert_subject_field_hex(&device_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_ou {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device certificate OU mismatch"));
-    }
 
     {
         let reg_r = reg.read().unwrap();
@@ -1592,31 +1406,35 @@ fn handle_setup(
 
     let mut server_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut server_nonce);
-    let transcript_hash = ztp_cert_transcript_hash(
-        &device_id,
-        &device_pub_bytes,
-        &client_nonce,
-        &server_nonce,
-        &device_cert_buf,
-        server_cert_buf,
-    );
-    let server_sig = sign_transcript_hash(server_cert_key, &transcript_hash)?;
 
     send_all(stream, &server_nonce, sent)?;
-    send_blob(stream, server_cert_buf, sent)?;
-    send_blob(stream, &server_sig, sent)?;
+    send_all(stream, server_static_pub.compress().as_bytes(), sent)?;
+    let (a_s, s_s) = schnorr_prove_setup_server(
+        server_static_secret,
+        server_static_pub,
+        &device_id,
+        &device_static_pub,
+        &client_nonce,
+        &server_nonce,
+    );
+    send_all(stream, a_s.compress().as_bytes(), sent)?;
+    send_all(stream, &s_s.to_bytes(), sent)?;
     stream.flush()?;
 
     let a = recv_point(stream, recv, "setup_A")?;
     let s = recv_scalar(stream, recv)?;
-    let device_sig = recv_blob(stream, MAX_SIG_SIZE, recv)?;
 
-    if !schnorr_verify_setup(&device_static_pub, &device_id, &server_nonce, &a, &s) {
+    if !schnorr_verify_setup(
+        &device_static_pub,
+        &device_id,
+        server_static_pub,
+        &client_nonce,
+        &server_nonce,
+        &a,
+        &s,
+    ) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Schnorr proof invalid"));
     }
-
-    let device_cert_pubkey = device_cert.public_key().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("device pubkey extract failed: {e}")))?;
-    verify_transcript_hash_sig(&device_cert_pubkey, &transcript_hash, &device_sig)?;
 
     let upsert = {
         let mut reg_w = reg.write().unwrap();
@@ -1627,15 +1445,13 @@ fn handle_setup(
     };
 
     println!(
-        "Server[SETUP/ZTP]: {} device_id={} via mutual certificate onboarding",
+        "Server[SETUP/RPK]: {} device_id={} via raw-public-key onboarding",
         if upsert { "enrolled NEW" } else { "validated existing" },
         hex::encode(device_id),
     );
 
     send_all(stream, &[0x01u8], sent)?;
     stream.flush()?;
-    let _ = server_static_pub;
-    let _ = server_cert;
     Ok(())
 }
 
@@ -1890,10 +1706,6 @@ fn handle_client(
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
     reg: Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
-    server_cert_buf: Arc<Vec<u8>>,
-    server_cert_key: Arc<PKey<Private>>,
-    server_cert: Arc<X509>,
-    ca_cert: Arc<X509>,
     replay: Arc<Mutex<ReplayCache>>,
     failures: Arc<Mutex<FailureTracker>>,
     _active_guard: ActiveConnGuard,
@@ -1925,9 +1737,15 @@ fn handle_client(
 
     let res = match msg_type {
         MSG_SETUP => handle_setup(
-            &mut stream, &policy, &server_static_pub,
-            &reg, &server_cert_buf, &server_cert, &server_cert_key, &ca_cert,
-            &mut sent, &mut recv_bytes, &failures, &peer_key,
+            &mut stream,
+            &policy,
+            &server_static_secret,
+            &server_static_pub,
+            &reg,
+            &mut sent,
+            &mut recv_bytes,
+            &failures,
+            &peer_key,
         ),
         MSG_AUTH_V2 => handle_auth_v2(
             stream, &server_static_secret, &server_static_pub,
@@ -2047,21 +1865,7 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    let server_cert_buf = read_file_all(SERVER_CERT_FILE, MAX_CERT_FILE_SIZE)?;
     verify_private_file_permissions(SERVER_SK_FILE)?;
-    verify_private_file_permissions(SERVER_CERT_KEY_FILE)?;
-    let server_key_buf = read_file_all(SERVER_CERT_KEY_FILE, MAX_CERT_FILE_SIZE)?;
-    let ca_cert_buf = read_file_all(CA_CERT_FILE, MAX_CERT_FILE_SIZE)?;
-    let server_cert = load_cert_from_bytes(&server_cert_buf)?;
-    let ca_cert = load_cert_from_bytes(&ca_cert_buf)?;
-    let server_cert_key = load_private_key_from_bytes(&server_key_buf)?;
-    verify_cert_against_ca(&server_cert, &ca_cert)?;
-    let expected_server_ou = hex::encode(server_static_pub.compress().to_bytes());
-    require_eku(&server_cert, EKU_TLS_SERVER_AUTH)?;
-    require_custom_identity_extension(&server_cert, SERVER_IDENTITY_OID, &expected_server_ou)?;
-    if cert_subject_field_hex(&server_cert, openssl::nid::Nid::ORGANIZATIONALUNITNAME)? != expected_server_ou {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Server certificate OU does not match server_pub"));
-    }
 
     let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
@@ -2100,7 +1904,7 @@ fn main() -> std::io::Result<()> {
     println!("C-compatible Rust Server listening on {}", bind_addr);
     println!("Server public key (pin this on client): {}", hex::encode(server_static_pub.compress().to_bytes()));
     println!(
-        "Server: pairing_enabled={} token_configured={} deadline={} mutual_cert_onboarding=true",
+        "Server: pairing_enabled={} token_configured={} deadline={} raw_pubkey_onboarding=true",
         policy.enabled,
         policy.token.is_some(),
         if policy.deadline.is_some() { "set" } else { "none" },
@@ -2108,10 +1912,6 @@ fn main() -> std::io::Result<()> {
 
     let ss = Arc::new(server_static_secret);
     let sp = Arc::new(server_static_pub);
-    let server_cert_buf = Arc::new(server_cert_buf);
-    let server_cert_key = Arc::new(server_cert_key);
-    let server_cert = Arc::new(server_cert);
-    let ca_cert = Arc::new(ca_cert);
 
     loop {
         let (stream, _) = listener.accept()?;
@@ -2119,10 +1919,6 @@ fn main() -> std::io::Result<()> {
         let sp2 = Arc::clone(&sp);
         let pol2 = policy.clone();
         let reg2 = Arc::clone(&reg);
-        let scb2 = Arc::clone(&server_cert_buf);
-        let sck2 = Arc::clone(&server_cert_key);
-        let sc2 = Arc::clone(&server_cert);
-        let ca2 = Arc::clone(&ca_cert);
         let rep2 = Arc::clone(&replay);
         let failures2 = Arc::clone(&failures);
         let active2 = Arc::clone(&active_connections);
@@ -2132,7 +1928,7 @@ fn main() -> std::io::Result<()> {
             continue;
         };
         thread::spawn(move || {
-            handle_client(stream, ss2, sp2, pol2, reg2, scb2, sck2, sc2, ca2, rep2, failures2, active_guard);
+            handle_client(stream, ss2, sp2, pol2, reg2, rep2, failures2, active_guard);
         });
     }
 }
