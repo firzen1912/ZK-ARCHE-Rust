@@ -29,6 +29,8 @@ use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const SETUP_CHALLENGE_LEN: usize = 16;
+
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
 const MSG_HEARTBEAT: u8 = 0x10;
@@ -40,8 +42,6 @@ const REGISTRY_BAK: &str = "/var/lib/iot-auth/server/registry.bak";
 const REPLAY_CACHE_BIN: &str = "/var/lib/iot-auth/server/replay_cache.bin";
 const SERVER_SK_FILE: &str = "/var/lib/iot-auth/server/server_sk.bin";
 const OFFLINE_COUNTERS_BIN: &str = "/var/lib/iot-auth/server/offline_counters.bin";
-const SERVER_CONTINUITY_FILE: &str = "/var/lib/iot-auth/server/continuity.bin";
-const CLIENT_CONTINUITY_TRACKS_BIN: &str = "/var/lib/iot-auth/server/client_continuity_tracks.bin";
 
 const T_SETUP: &[u8] = b"setup_client_schnorr_v1";
 const T_SETUP_SERVER: &[u8] = b"setup_server_schnorr_v1";
@@ -49,8 +49,7 @@ const T_CLIENT: &[u8] = b"client_schnorr_v1";
 const T_SERVER: &[u8] = b"server_schnorr_v1";
 const T_KC: &[u8] = b"kc_v1";
 const T_OFFLINE: &[u8] = b"offline_schnorr_v1";
-const T_CLIENT_CONT: &[u8] = b"client_continuity_v1";
-const T_SERVER_CONT: &[u8] = b"server_continuity_v1";
+const T_ATTR_ROLE: &[u8] = b"client_attr_role_v1";
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const ONLINE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -65,6 +64,13 @@ const MAX_OFFLINE_FIELD: usize = 256;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_BAN: Duration = Duration::from_secs(120);
 const MAX_FAILURES_PER_WINDOW: u32 = 8;
+
+#[derive(Clone, Copy)]
+struct DeviceRecord {
+    pubkey: RistrettoPoint,
+    role_commitment: RistrettoPoint,
+    role_code: u64,
+}
 
 /// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
 struct NonceCounter {
@@ -167,6 +173,21 @@ fn random_bytes_32() -> [u8; 32] {
     b
 }
 
+fn hash_to_point(label: &[u8]) -> RistrettoPoint {
+    let mut h = Sha512::new();
+    sha2::Digest::update(&mut h, b"ristretto-hash-to-point-v1");
+    sha2::Digest::update(&mut h, label);
+    let digest = h.finalize();
+
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&digest);
+    RistrettoPoint::from_uniform_bytes(&wide)
+}
+
+fn attr_h() -> RistrettoPoint {
+    hash_to_point(b"iot-auth/attr-h/v1")
+}
+
 /// Rejects the neutral Ristretto point so invalid or low-order inputs are not accepted.
 fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     if *p == RistrettoPoint::default() {
@@ -185,6 +206,7 @@ fn schnorr_verify_setup(
     server_static_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    setup_challenge: &[u8; SETUP_CHALLENGE_LEN],
     a: &RistrettoPoint,
     s: &Scalar,
 ) -> bool {
@@ -198,6 +220,7 @@ fn schnorr_verify_setup(
             (b"a", TranscriptValue::Point(a)),
             (b"client_nonce", TranscriptValue::Bytes(client_nonce)),
             (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
+            (b"setup_challenge", TranscriptValue::Bytes(setup_challenge)),
         ],
     );
     RISTRETTO_BASEPOINT_POINT * s == a + pubkey * c
@@ -211,6 +234,7 @@ fn schnorr_prove_setup_server(
     device_static_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    setup_challenge: &[u8; SETUP_CHALLENGE_LEN],
 ) -> (RistrettoPoint, Scalar) {
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
@@ -224,6 +248,7 @@ fn schnorr_prove_setup_server(
             (b"a", TranscriptValue::Point(&a)),
             (b"client_nonce", TranscriptValue::Bytes(client_nonce)),
             (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
+            (b"setup_challenge", TranscriptValue::Bytes(setup_challenge)),
         ],
     );
     let s = r + c * server_secret;
@@ -272,6 +297,33 @@ fn schnorr_prove_server(
     );
     let s = r + c * server_secret;
     (a, s)
+}
+
+fn verify_role_commitment_opening(
+    commitment: &RistrettoPoint,
+    a: &RistrettoPoint,
+    s_attr: &Scalar,
+    s_blind: &Scalar,
+    device_id: &[u8; 32],
+    nonce_c: &[u8; 32],
+    eph_c: &RistrettoPoint,
+) -> bool {
+    let h = attr_h();
+
+    let c = transcript_challenge_scalar(
+        T_ATTR_ROLE,
+        &[
+            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"commitment", TranscriptValue::Point(commitment)),
+            (b"a", TranscriptValue::Point(a)),
+            (b"nonce_c", TranscriptValue::Bytes(nonce_c)),
+            (b"eph_c", TranscriptValue::Point(eph_c)),
+        ],
+    );
+
+    let lhs = (RISTRETTO_BASEPOINT_POINT * s_attr) + (h * s_blind);
+    let rhs = *a + (*commitment * c);
+    lhs == rhs
 }
 
 /// Derives the shared session key from the Ristretto ECDHE secret, handshake nonces, identities, and X25519 tunnel binding.
@@ -444,19 +496,46 @@ fn recv_pairing_token(stream: &mut impl Read, recv: &mut usize) -> std::io::Resu
 }
 
 /// Loads the device registry mapping device identifiers to registered static public keys.
-fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], RistrettoPoint>> {
+fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], DeviceRecord>> {
     let mut reg = HashMap::new();
     let data = fs::read(path).unwrap_or_default();
-    for chunk in data.chunks_exact(64) {
+    if data.is_empty() {
+        return Ok(reg);
+    }
+    if data.len() % 104 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "registry.bin corrupt length",
+        ));
+    }
+    for chunk in data.chunks_exact(104) {
         let mut id = [0u8; 32];
         id.copy_from_slice(&chunk[0..32]);
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&chunk[32..64]);
-        if let Some(p) = CompressedRistretto(pk).decompress() {
-            if p != RistrettoPoint::default() {
-                reg.insert(id, p);
-            }
+        let mut role_commitment_bytes = [0u8; 32];
+        role_commitment_bytes.copy_from_slice(&chunk[64..96]);
+        let role_code = u64::from_le_bytes(chunk[96..104].try_into().unwrap());
+
+        let pubkey = CompressedRistretto(pk)
+            .decompress()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "registry pubkey invalid"))?;
+        let role_commitment = CompressedRistretto(role_commitment_bytes)
+            .decompress()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "registry role commitment invalid"))?;
+
+        if pubkey == RistrettoPoint::default() || role_commitment == RistrettoPoint::default() {
+            continue;
         }
+
+        reg.insert(
+            id,
+            DeviceRecord {
+                pubkey,
+                role_commitment,
+                role_code,
+            },
+        );
     }
     Ok(reg)
 }
@@ -465,7 +544,7 @@ fn load_registry(path: &str) -> std::io::Result<HashMap<[u8; 32], RistrettoPoint
 fn save_registry_atomic(
     path: &str,
     bak_path: &str,
-    reg: &HashMap<[u8; 32], RistrettoPoint>,
+    reg: &HashMap<[u8; 32], DeviceRecord>,
 ) -> std::io::Result<()> {
     ensure_parent_dir(path)?;
     ensure_parent_dir(bak_path)?;
@@ -473,10 +552,12 @@ fn save_registry_atomic(
         let _ = fs::copy(path, bak_path);
     }
     let _tmp = format!("{path}.tmp");
-    let mut out = Vec::with_capacity(reg.len() * 64);
-    for (id, pk) in reg {
+    let mut out = Vec::with_capacity(reg.len() * 104);
+    for (id, rec) in reg {
         out.extend_from_slice(id);
-        out.extend_from_slice(pk.compress().as_bytes());
+        out.extend_from_slice(rec.pubkey.compress().as_bytes());
+        out.extend_from_slice(rec.role_commitment.compress().as_bytes());
+        out.extend_from_slice(&rec.role_code.to_le_bytes());
     }
     write_private_file_atomic(path, &out)?;
     Ok(())
@@ -1016,357 +1097,6 @@ fn verify_offline_proof(
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-/// Stores continuity-tracking state that links one successful session to the next.
-struct ContinuityState {
-    version: u8,
-    role: u8,
-    identity: [u8; 32],
-    pubkey: [u8; 32],
-    continuity_counter: u64,
-    reconnect_epoch: u64,
-    last_peer_id: [u8; 32],
-    last_checkpoint_hash: [u8; 32],
-    state_hash: [u8; 32],
-}
-
-#[derive(Clone, Debug)]
-/// Represents a continuity proof used to bind reconnects to prior state.
-struct ContinuityProof {
-    version: u8,
-    role: u8,
-    identity: [u8; 32],
-    pubkey: [u8; 32],
-    peer_id: [u8; 32],
-    issued_at: u64,
-    expires_at: u64,
-    continuity_counter: u64,
-    reconnect_epoch: u64,
-    prev_checkpoint_hash: [u8; 32],
-    state_hash: [u8; 32],
-    checkpoint_hash: [u8; 32],
-    a: [u8; 32],
-    s: [u8; 32],
-}
-
-/// Parses a 32-byte value from a 64-character hexadecimal string.
-fn parse_hash32_hex(s: &str) -> std::io::Result<[u8; 32]> {
-    let decoded = hex::decode(s).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid hex string")
-    })?;
-    if decoded.len() != 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "expected exactly 32 bytes of hex data",
-        ));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&decoded);
-    Ok(out)
-}
-
-/// Stores continuity-tracking state that links one successful session to the next.
-impl ContinuityState {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(178);
-        out.push(self.version);
-        out.push(self.role);
-        out.extend_from_slice(&self.identity);
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&self.continuity_counter.to_le_bytes());
-        out.extend_from_slice(&self.reconnect_epoch.to_le_bytes());
-        out.extend_from_slice(&self.last_peer_id);
-        out.extend_from_slice(&self.last_checkpoint_hash);
-        out.extend_from_slice(&self.state_hash);
-        out
-    }
-    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
-        if buf.len() != 178 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("continuity state wrong length: got {}, expected 178", buf.len()),
-            ));
-        }
-        let mut off = 0usize;
-        let version = buf[off]; off += 1;
-        let role = buf[off]; off += 1;
-        let mut identity = [0u8; 32]; identity.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut pubkey = [0u8; 32]; pubkey.copy_from_slice(&buf[off..off+32]); off += 32;
-        let continuity_counter = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
-        let reconnect_epoch = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
-        let mut last_peer_id = [0u8; 32]; last_peer_id.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut last_checkpoint_hash = [0u8; 32]; last_checkpoint_hash.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut state_hash = [0u8; 32]; state_hash.copy_from_slice(&buf[off..off+32]);
-        Ok(Self { version, role, identity, pubkey, continuity_counter, reconnect_epoch, last_peer_id, last_checkpoint_hash, state_hash })
-    }
-}
-
-/// Represents a continuity proof used to bind reconnects to prior state.
-impl ContinuityProof {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(290);
-        out.push(self.version);
-        out.push(self.role);
-        out.extend_from_slice(&self.identity);
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&self.peer_id);
-        out.extend_from_slice(&self.issued_at.to_le_bytes());
-        out.extend_from_slice(&self.expires_at.to_le_bytes());
-        out.extend_from_slice(&self.continuity_counter.to_le_bytes());
-        out.extend_from_slice(&self.reconnect_epoch.to_le_bytes());
-        out.extend_from_slice(&self.prev_checkpoint_hash);
-        out.extend_from_slice(&self.state_hash);
-        out.extend_from_slice(&self.checkpoint_hash);
-        out.extend_from_slice(&self.a);
-        out.extend_from_slice(&self.s);
-        out
-    }
-    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
-        if buf.len() != 290 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("continuity proof wrong length: got {}, expected 290", buf.len()),
-            ));
-        }
-        let mut off = 0usize;
-        let version = buf[off]; off += 1;
-        let role = buf[off]; off += 1;
-        let mut identity = [0u8; 32]; identity.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut pubkey = [0u8; 32]; pubkey.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut peer_id = [0u8; 32]; peer_id.copy_from_slice(&buf[off..off+32]); off += 32;
-        let issued_at = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
-        let expires_at = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
-        let continuity_counter = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
-        let reconnect_epoch = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8;
-        let mut prev_checkpoint_hash = [0u8; 32]; prev_checkpoint_hash.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut state_hash = [0u8; 32]; state_hash.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut checkpoint_hash = [0u8; 32]; checkpoint_hash.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut a = [0u8; 32]; a.copy_from_slice(&buf[off..off+32]); off += 32;
-        let mut s = [0u8; 32]; s.copy_from_slice(&buf[off..off+32]);
-        Ok(Self { version, role, identity, pubkey, peer_id, issued_at, expires_at, continuity_counter, reconnect_epoch, prev_checkpoint_hash, state_hash, checkpoint_hash, a, s })
-    }
-}
-
-/// Derives the next continuity checkpoint hash from the previous checkpoint and current state.
-fn next_checkpoint_hash(prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"continuity-checkpoint-v1");
-    sha2::Digest::update(&mut h, prev_checkpoint_hash);
-    sha2::Digest::update(&mut h, state_hash);
-    sha2::Digest::update(&mut h, &continuity_counter.to_le_bytes());
-    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
-    sha2::Digest::update(&mut h, peer_id);
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Builds the Schnorr-style challenge scalar used for continuity proofs.
-fn continuity_challenge_scalar(domain: &[u8], role: u8, identity: &[u8; 32], pubkey: &RistrettoPoint, peer_id: &[u8; 32], issued_at: u64, expires_at: u64, continuity_counter: u64, reconnect_epoch: u64, prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], checkpoint_hash: &[u8; 32], a: &RistrettoPoint) -> Scalar {
-    transcript_challenge_scalar(
-        domain,
-        &[
-            (b"role", TranscriptValue::U8(role)),
-            (b"identity", TranscriptValue::Bytes(identity)),
-            (b"pubkey", TranscriptValue::Point(pubkey)),
-            (b"peer_id", TranscriptValue::Bytes(peer_id)),
-            (b"issued_at", TranscriptValue::U64(issued_at)),
-            (b"expires_at", TranscriptValue::U64(expires_at)),
-            (b"continuity_counter", TranscriptValue::U64(continuity_counter)),
-            (b"reconnect_epoch", TranscriptValue::U64(reconnect_epoch)),
-            (b"prev_checkpoint_hash", TranscriptValue::Bytes(prev_checkpoint_hash)),
-            (b"state_hash", TranscriptValue::Bytes(state_hash)),
-            (b"checkpoint_hash", TranscriptValue::Bytes(checkpoint_hash)),
-            (b"a", TranscriptValue::Point(a)),
-        ],
-    )
-}
-
-/// Derives a stable server identity from the server public key.
-fn server_identity_from_pub(p: &RistrettoPoint) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"server-id-v1");
-    sha2::Digest::update(&mut h, p.compress().as_bytes());
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Hashes the server continuity state together with registry state and peer identity.
-fn hash_server_continuity_state(server_identity: &[u8; 32], server_pub: &[u8; 32], registry: &HashMap<[u8; 32], RistrettoPoint>, continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"server-state-v1");
-    sha2::Digest::update(&mut h, server_identity);
-    sha2::Digest::update(&mut h, server_pub);
-    sha2::Digest::update(&mut h, &continuity_counter.to_le_bytes());
-    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
-    sha2::Digest::update(&mut h, peer_id);
-    let mut entries: Vec<([u8;32],[u8;32])> = registry.iter().map(|(id,p)| (*id, p.compress().to_bytes())).collect();
-    entries.sort_by(|a,b| a.0.cmp(&b.0));
-    for (id, pk) in entries {
-        sha2::Digest::update(&mut h, &id);
-        sha2::Digest::update(&mut h, &pk);
-    }
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Loads or initializes the server continuity chain state.
-fn load_or_init_server_continuity_state(
-    server_static_pub: &RistrettoPoint,
-    registry: &HashMap<[u8; 32], RistrettoPoint>,
-    peer_id: &[u8; 32],
-) -> std::io::Result<ContinuityState> {
-    let server_identity = server_identity_from_pub(server_static_pub);
-    let pubkey = server_static_pub.compress().to_bytes();
-
-    if Path::new(SERVER_CONTINUITY_FILE).exists() {
-        verify_private_file_permissions(SERVER_CONTINUITY_FILE)?;
-        let st = ContinuityState::deserialize(&fs::read(SERVER_CONTINUITY_FILE)?)?;
-
-        if st.role == 2 && st.identity == server_identity && st.pubkey == pubkey {
-            return Ok(st);
-        }
-
-        eprintln!(
-            "Server[CONTINUITY]: existing continuity state does not match current server key; reinitializing"
-        );
-    }
-
-    let state_hash =
-        hash_server_continuity_state(&server_identity, &pubkey, registry, 0, 0, peer_id);
-
-    let st = ContinuityState {
-        version: 1,
-        role: 2,
-        identity: server_identity,
-        pubkey,
-        continuity_counter: 0,
-        reconnect_epoch: 0,
-        last_peer_id: *peer_id,
-        last_checkpoint_hash: [0u8; 32],
-        state_hash,
-    };
-
-    write_private_file_atomic(SERVER_CONTINUITY_FILE, &st.serialize())?;
-    Ok(st)
-}
-
-/// Persists the server continuity chain state.
-fn save_server_continuity_state(st: &ContinuityState) -> std::io::Result<()> { write_private_file_atomic(SERVER_CONTINUITY_FILE, &st.serialize()) }
-
-/// Loads per-client continuity tracking records from disk.
-fn client_tracks_load() -> std::io::Result<HashMap<[u8;32], ContinuityState>> {
-    if !Path::new(CLIENT_CONTINUITY_TRACKS_BIN).exists() { return Ok(HashMap::new()); }
-    verify_private_file_permissions(CLIENT_CONTINUITY_TRACKS_BIN)?;
-    let data = fs::read(CLIENT_CONTINUITY_TRACKS_BIN)?;
-    if data.len() % 178 != 0 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "client continuity track store corrupt")); }
-    let mut out = HashMap::new();
-    for chunk in data.chunks_exact(178) {
-        let st = ContinuityState::deserialize(chunk)?;
-        out.insert(st.identity, st);
-    }
-    Ok(out)
-}
-
-/// Persists per-client continuity tracking records to disk.
-fn client_tracks_save(m: &HashMap<[u8;32], ContinuityState>) -> std::io::Result<()> {
-    let mut keys: Vec<[u8;32]> = m.keys().copied().collect();
-    keys.sort();
-    let mut out = Vec::with_capacity(keys.len() * 178);
-    for k in keys { out.extend_from_slice(&m[&k].serialize()); }
-    write_private_file_atomic(CLIENT_CONTINUITY_TRACKS_BIN, &out)
-}
-
-/// Verifies a client continuity proof and optionally persists the updated per-client track.
-fn verify_client_continuity_proof_inline(proof: &ContinuityProof, reg: &HashMap<[u8;32], RistrettoPoint>, persist: bool) -> std::io::Result<ContinuityState> {
-    if proof.role != 1 { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "proof is not a client continuity proof")); }
-    let expected_pub = reg.get(&proof.identity).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity identity is not enrolled"))?;
-    if expected_pub.compress().to_bytes().ct_eq(&proof.pubkey).unwrap_u8() == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity pubkey mismatch"));
-    }
-    let server_static_secret = load_or_create_server_sk(SERVER_SK_FILE)?;
-    let server_static_pub = RISTRETTO_BASEPOINT_POINT * server_static_secret;
-    let expected_peer_id = server_identity_from_pub(&server_static_pub);
-    if proof.peer_id != expected_peer_id {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity peer binding mismatch"));
-    }
-    let now = unix_time_now()?;
-    if proof.issued_at >= proof.expires_at || now < proof.issued_at || now > proof.expires_at {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity proof expired or not yet valid"));
-    }
-    let mut tracks = client_tracks_load()?;
-    let entry = tracks.entry(proof.identity).or_insert(ContinuityState {
-        version:1, role:1, identity:proof.identity, pubkey:proof.pubkey, continuity_counter:0, reconnect_epoch:0, last_peer_id:expected_peer_id, last_checkpoint_hash:[0u8;32], state_hash:[0u8;32],
-    });
-    if proof.continuity_counter <= entry.continuity_counter {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity replay detected"));
-    }
-    if proof.prev_checkpoint_hash != entry.last_checkpoint_hash {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity checkpoint chain mismatch"));
-    }
-    let recomputed_checkpoint = next_checkpoint_hash(&proof.prev_checkpoint_hash, &proof.state_hash, proof.continuity_counter, proof.reconnect_epoch, &proof.peer_id);
-    if recomputed_checkpoint != proof.checkpoint_hash {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity checkpoint hash mismatch"));
-    }
-    let a = CompressedRistretto(proof.a).decompress().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity A invalid"))?;
-    reject_identity(&a, "client continuity A")?;
-    let s: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.s)).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity s non-canonical"))?;
-    let c = continuity_challenge_scalar(T_CLIENT_CONT, proof.role, &proof.identity, expected_pub, &proof.peer_id, proof.issued_at, proof.expires_at, proof.continuity_counter, proof.reconnect_epoch, &proof.prev_checkpoint_hash, &proof.state_hash, &proof.checkpoint_hash, &a);
-    if RISTRETTO_BASEPOINT_POINT * s != a + (*expected_pub * c) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity Schnorr proof invalid"));
-    }
-    entry.continuity_counter = proof.continuity_counter;
-    entry.reconnect_epoch = proof.reconnect_epoch;
-    entry.last_checkpoint_hash = proof.checkpoint_hash;
-    entry.state_hash = proof.state_hash;
-    let out = entry.clone();
-    if persist { client_tracks_save(&tracks)?; }
-    Ok(out)
-}
-
-/// Builds a candidate server continuity proof without persisting the new server state yet.
-fn prepare_server_continuity_proof(server_static_secret: &Scalar, server_static_pub: &RistrettoPoint, registry: &HashMap<[u8;32], RistrettoPoint>, peer_id: [u8;32], expires_in: u64) -> std::io::Result<(ContinuityProof, ContinuityState)> {
-    if expires_in == 0 || expires_in > 300 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in must be between 1 and 300")); }
-    let current = load_or_init_server_continuity_state(server_static_pub, registry, &peer_id)?;
-    let mut pending = current.clone();
-    pending.last_peer_id = peer_id;
-    pending.continuity_counter = pending.continuity_counter.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server continuity counter exhausted"))?;
-    pending.reconnect_epoch = pending.reconnect_epoch.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "server reconnect epoch exhausted"))?;
-    pending.state_hash = hash_server_continuity_state(&pending.identity, &pending.pubkey, registry, pending.continuity_counter, pending.reconnect_epoch, &peer_id);
-    let checkpoint_hash = next_checkpoint_hash(&current.last_checkpoint_hash, &pending.state_hash, pending.continuity_counter, pending.reconnect_epoch, &peer_id);
-    let issued_at = unix_time_now()?;
-    let expires_at = issued_at.checked_add(expires_in).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "expires_at overflow"))?;
-    let r = random_scalar();
-    let a = RISTRETTO_BASEPOINT_POINT * r;
-    let c = continuity_challenge_scalar(T_SERVER_CONT, pending.role, &pending.identity, server_static_pub, &peer_id, issued_at, expires_at, pending.continuity_counter, pending.reconnect_epoch, &current.last_checkpoint_hash, &pending.state_hash, &checkpoint_hash, &a);
-    let s = r + c * server_static_secret;
-    let proof = ContinuityProof { version:1, role: pending.role, identity: pending.identity, pubkey: pending.pubkey, peer_id, issued_at, expires_at, continuity_counter: pending.continuity_counter, reconnect_epoch: pending.reconnect_epoch, prev_checkpoint_hash: current.last_checkpoint_hash, state_hash: pending.state_hash, checkpoint_hash, a: a.compress().to_bytes(), s: s.to_bytes() };
-    pending.last_checkpoint_hash = checkpoint_hash;
-    Ok((proof, pending))
-}
-
-/// Builds a server continuity proof file for a specific peer.
-fn build_server_continuity_proof(output_path: &str, server_static_secret: &Scalar, server_static_pub: &RistrettoPoint, registry: &HashMap<[u8;32], RistrettoPoint>, peer_id: [u8;32], expires_in: u64) -> std::io::Result<()> {
-    let (proof, pending) = prepare_server_continuity_proof(server_static_secret, server_static_pub, registry, peer_id, expires_in)?;
-    save_server_continuity_state(&pending)?;
-    write_private_file_atomic(output_path, &proof.serialize())?;
-    println!("Server[CONTINUITY]: wrote server continuity proof to {} counter={} reconnect_epoch={} checkpoint_hash={}", output_path, pending.continuity_counter, pending.reconnect_epoch, hex::encode(proof.checkpoint_hash));
-    Ok(())
-}
-
-/// Verifies a client continuity proof against the registered client key.
-fn verify_client_continuity_proof(path: &str, reg: &HashMap<[u8;32], RistrettoPoint>) -> std::io::Result<()> {
-    let proof = ContinuityProof::deserialize(&fs::read(path)?)?;
-    let st = verify_client_continuity_proof_inline(&proof, reg, true)?;
-    println!("Server[CONTINUITY]: verified returning client continuity proof file={} device_id={} counter={} reconnect_epoch={}", path, hex::encode(proof.identity), st.continuity_counter, st.reconnect_epoch);
-    Ok(())
-}
-
 /// Processes a client setup request, validates certificates and setup proofs, enforces pairing policy, and registers the client key.
 /// Step 1: read the incoming setup request, pairing token, client identity, and certificate material.
 fn handle_setup(
@@ -1374,7 +1104,7 @@ fn handle_setup(
     policy: &PairingPolicy,
     server_static_secret: &Scalar,
     server_static_pub: &RistrettoPoint,
-    reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
+    reg: &Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
     sent: &mut usize,
     recv: &mut usize,
     failures: &Arc<Mutex<FailureTracker>>,
@@ -1394,11 +1124,12 @@ fn handle_setup(
     let device_pub_bytes = device_static_pub.compress().to_bytes();
     let mut client_nonce = [0u8; 32];
     recv_exact(stream, &mut client_nonce, recv)?;
+    let role_commitment = recv_point(stream, recv, "role_commitment")?;
 
     {
         let reg_r = reg.read().unwrap();
         if let Some(existing) = reg_r.get(&device_id) {
-            if existing.compress().to_bytes().ct_eq(&device_pub_bytes).unwrap_u8() == 0 {
+            if existing.pubkey.compress().to_bytes().ct_eq(&device_pub_bytes).unwrap_u8() == 0 {
                 return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "device_id collision"));
             }
         }
@@ -1406,8 +1137,11 @@ fn handle_setup(
 
     let mut server_nonce = [0u8; 32];
     OsRng.fill_bytes(&mut server_nonce);
+    let mut setup_challenge = [0u8; SETUP_CHALLENGE_LEN];
+    OsRng.fill_bytes(&mut setup_challenge);
 
     send_all(stream, &server_nonce, sent)?;
+    send_all(stream, &setup_challenge, sent)?;
     send_all(stream, server_static_pub.compress().as_bytes(), sent)?;
     let (a_s, s_s) = schnorr_prove_setup_server(
         server_static_secret,
@@ -1416,6 +1150,7 @@ fn handle_setup(
         &device_static_pub,
         &client_nonce,
         &server_nonce,
+        &setup_challenge,
     );
     send_all(stream, a_s.compress().as_bytes(), sent)?;
     send_all(stream, &s_s.to_bytes(), sent)?;
@@ -1430,6 +1165,7 @@ fn handle_setup(
         server_static_pub,
         &client_nonce,
         &server_nonce,
+        &setup_challenge,
         &a,
         &s,
     ) {
@@ -1439,7 +1175,11 @@ fn handle_setup(
     let upsert = {
         let mut reg_w = reg.write().unwrap();
         let existed = reg_w.contains_key(&device_id);
-        reg_w.insert(device_id, device_static_pub);
+        reg_w.insert(device_id, DeviceRecord {
+            pubkey: device_static_pub,
+            role_commitment,
+            role_code: 1u64,
+        });
         save_registry_atomic(REGISTRY_BIN, REGISTRY_BAK, &reg_w)?;
         !existed
     };
@@ -1461,7 +1201,7 @@ fn handle_auth_v2(
     mut stream: TcpStream,
     server_static_secret: &Scalar,
     server_static_pub: &RistrettoPoint,
-    reg: &Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
+    reg: &Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
     replay: &Arc<Mutex<ReplayCache>>,
     sent: &mut usize,
     recv: &mut usize,
@@ -1502,10 +1242,10 @@ fn handle_auth_v2(
         .decrypt(&nonce_rx_ctr.next(), rx_ct.as_ref())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed"))?;
 
-    if pt.len() != 160 {
+    if pt.len() != 288 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("invalid payload size: {} (expected 160)", pt.len()),
+            format!("invalid payload size: {} (expected 288)", pt.len()),
         ));
     }
 
@@ -1514,6 +1254,10 @@ fn handle_auth_v2(
     let mut s_c_bytes   = [0u8; 32]; s_c_bytes.copy_from_slice(&pt[64..96]);
     let mut nonce_c     = [0u8; 32]; nonce_c.copy_from_slice(&pt[96..128]);
     let mut eph_c_bytes = [0u8; 32]; eph_c_bytes.copy_from_slice(&pt[128..160]);
+    let mut role_commitment_bytes = [0u8; 32]; role_commitment_bytes.copy_from_slice(&pt[160..192]);
+    let mut attr_a_bytes = [0u8; 32]; attr_a_bytes.copy_from_slice(&pt[192..224]);
+    let mut attr_s_attr_bytes = [0u8; 32]; attr_s_attr_bytes.copy_from_slice(&pt[224..256]);
+    let mut attr_s_blind_bytes = [0u8; 32]; attr_s_blind_bytes.copy_from_slice(&pt[256..288]);
 
     let a_c = CompressedRistretto(a_c_bytes)
         .decompress()
@@ -1527,6 +1271,22 @@ fn handle_auth_v2(
         .decompress()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid eph_c"))?;
     reject_identity(&eph_c, "eph_c")?;
+
+    let role_commitment = CompressedRistretto(role_commitment_bytes)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid role_commitment"))?;
+    reject_identity(&role_commitment, "role_commitment")?;
+
+    let attr_a = CompressedRistretto(attr_a_bytes)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid attr_a"))?;
+    reject_identity(&attr_a, "attr_a")?;
+
+    let attr_s_attr: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(attr_s_attr_bytes))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical attr_s_attr"))?;
+
+    let attr_s_blind: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(attr_s_blind_bytes))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical attr_s_blind"))?;
 
     if failures.lock().unwrap().is_blocked(peer_key) {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer temporarily rate limited"));
@@ -1547,10 +1307,10 @@ fn handle_auth_v2(
     }
 
     // Step 4: look up the registered device key and verify the client Schnorr proof against it.
-    let expected_pub = {
+    let record = {
         let reg_r = reg.read().unwrap();
         match reg_r.get(&device_id) {
-            Some(p) => *p,
+            Some(r) => *r,
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -1560,7 +1320,7 @@ fn handle_auth_v2(
         }
     };
 
-    if !schnorr_verify_auth(&expected_pub, &device_id, &a_c, &s_c, &nonce_c, &eph_c) {
+    if !schnorr_verify_auth(&record.pubkey, &device_id, &a_c, &s_c, &nonce_c, &eph_c) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "client Schnorr proof invalid",
@@ -1624,29 +1384,8 @@ fn handle_auth_v2(
         ));
     }
 
-    let rx_ct3 = recv_encrypted_blob(&mut stream, recv)?;
-    let client_cont_plain = cipher_rx
-        .decrypt(&nonce_rx_ctr.next(), rx_ct3.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed on client continuity proof"))?;
-    let client_cont_proof = ContinuityProof::deserialize(&client_cont_plain)?;
-    let reg_r = reg.read().unwrap();
-    println!("Server[CONT]: received client continuity proof");
-    verify_client_continuity_proof_inline(&client_cont_proof, &reg_r, true)?;
-    println!("Server[CONT]: client continuity proof verified");
-    println!("Server[CONT]: preparing pending server continuity state");
-    let (server_cont_proof, pending_server_state) = prepare_server_continuity_proof(server_static_secret, server_static_pub, &reg_r, device_id, 300)?;
-    let server_cont_blob = server_cont_proof.serialize();
-    println!("Server[CONT]: sending server continuity proof");
-    let tx_ct3 = cipher_tx
-        .encrypt(&nonce_tx_ctr.next(), server_cont_blob.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "encrypt failed on server continuity proof"))?;
-    send_blob(&mut stream, &tx_ct3, sent)?;
-    stream.flush()?;
-    save_server_continuity_state(&pending_server_state)?;
-    println!("Server[CONT]: committing continuity state");
-
     println!(
-        "Server[AUTH]: device_id={} KC=OK continuity=OK",
+        "Server[AUTH]: device_id={} KC=OK",
         hex::encode(device_id),
     );
 
@@ -1705,7 +1444,7 @@ fn handle_client(
     server_static_secret: Arc<Scalar>,
     server_static_pub: Arc<RistrettoPoint>,
     policy: PairingPolicy,
-    reg: Arc<RwLock<HashMap<[u8; 32], RistrettoPoint>>>,
+    reg: Arc<RwLock<HashMap<[u8; 32], DeviceRecord>>>,
     replay: Arc<Mutex<ReplayCache>>,
     failures: Arc<Mutex<FailureTracker>>,
     _active_guard: ActiveConnGuard,
@@ -1788,10 +1527,6 @@ fn main() -> std::io::Result<()> {
     let mut pairing_seconds: Option<u64> = None;
     let mut print_pubkey = false;
     let mut verify_offline_path: Option<String> = None;
-    let mut make_server_continuity_path: Option<String> = None;
-    let mut verify_client_continuity_path: Option<String> = None;
-    let mut continuity_peer_id: Option<[u8;32]> = None;
-    let mut continuity_expires_in: u64 = 300;
     let mut offline_audience: Option<String> = None;
     let mut offline_scopes: Vec<String> = Vec::new();
 
@@ -1820,29 +1555,9 @@ fn main() -> std::io::Result<()> {
                 verify_offline_path = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--make-server-continuity-proof" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-server-continuity-proof missing value")); }
-                make_server_continuity_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--verify-client-continuity-proof" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-client-continuity-proof missing value")); }
-                verify_client_continuity_path = Some(args[i + 1].clone());
-                i += 2;
-            }
             "--audience" => {
                 if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--audience missing value")); }
                 offline_audience = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--peer-id" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--peer-id missing value")); }
-                continuity_peer_id = Some(parse_hash32_hex(&args[i + 1])?);
-                i += 2;
-            }
-            "--continuity-expires-in" => {
-                if i + 1 >= args.len() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in missing value")); }
-                continuity_expires_in = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --continuity-expires-in"))?;
                 i += 2;
             }
             "--allow-offline-scope" => {
@@ -1851,7 +1566,7 @@ fn main() -> std::io::Result<()> {
                 i += 2;
             }
             _ => {
-                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey] [--verify-offline-proof FILE --audience NAME --allow-offline-scope SCOPE ...] [--make-server-continuity-proof FILE --peer-id HEX32 [--continuity-expires-in 300]] [--verify-client-continuity-proof FILE]", prog);
+                eprintln!("Usage: {} [--bind 0.0.0.0:4000] [--pairing] [--pairing-token TOKEN] [--pairing-seconds N] [--print-pubkey] [--verify-offline-proof FILE --audience NAME --allow-offline-scope SCOPE ...]", prog);
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown argument: {}", args[i])));
             }
         }
@@ -1869,7 +1584,7 @@ fn main() -> std::io::Result<()> {
 
     let deadline = pairing_seconds.map(|s| Instant::now() + Duration::from_secs(s));
     let policy = PairingPolicy { enabled: pairing, token: pairing_token, deadline };
-    let reg_map = load_registry(REGISTRY_BIN).unwrap_or_default();
+    let reg_map: HashMap<[u8; 32], DeviceRecord> = load_registry(REGISTRY_BIN).unwrap_or_default();
 
     // Step 3: handle utility modes such as offline-proof verification or continuity-proof generation.
     if let Some(proof_path) = verify_offline_path.as_deref() {
@@ -1884,14 +1599,9 @@ fn main() -> std::io::Result<()> {
         }
         let allowed_scopes: HashSet<String> = offline_scopes.into_iter().collect();
         let mut counters = OfflineCounterStore::load(OFFLINE_COUNTERS_BIN).unwrap_or_default();
-        return verify_offline_proof(proof_path, audience, &allowed_scopes, &reg_map, &mut counters);
-    }
-    if let Some(path) = verify_client_continuity_path.as_deref() {
-        return verify_client_continuity_proof(path, &reg_map);
-    }
-    if let Some(path) = make_server_continuity_path.as_deref() {
-        let peer_id = continuity_peer_id.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-server-continuity-proof requires --peer-id"))?;
-        return build_server_continuity_proof(path, &server_static_secret, &server_static_pub, &reg_map, peer_id, continuity_expires_in);
+        let reg_pub: HashMap<[u8; 32], RistrettoPoint> =
+            reg_map.iter().map(|(k, v)| (*k, v.pubkey)).collect();
+        return verify_offline_proof(proof_path, audience, &allowed_scopes, &reg_pub, &mut counters);
     }
     // Step 4: initialize shared server state and begin accepting TCP clients.
     let reg = Arc::new(RwLock::new(reg_map));

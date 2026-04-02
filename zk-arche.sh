@@ -13,6 +13,7 @@ CLIENT_BIN="${PROJECT_ROOT}/target/release/client"
 
 CLIENT_DEVICE_ROOT="${CLIENT_STATE_DIR}/device_root.bin"
 CLIENT_SERVER_PUB="${CLIENT_STATE_DIR}/server_pub.bin"
+CLIENT_ROLE_CRED="${CLIENT_STATE_DIR}/role_cred.bin"
 
 SERVER_SK_FILE="${SERVER_STATE_DIR}/server_sk.bin"
 SERVER_PUB_HEX_FILE="${SERVER_STATE_DIR}/server_pub.hex"
@@ -337,6 +338,7 @@ cmd_check_client_state() {
   log_header "Client state files"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
+  _status_file "$CLIENT_ROLE_CRED" "role credential"
 }
 
 cmd_start_server() {
@@ -430,6 +432,14 @@ cmd_setup_device() {
   [[ ${#extra_flags[@]} -gt 0 ]] && log_info "Extra flags: ${extra_flags[*]}"
   sudo "$CLIENT_BIN" --server "$server_addr" --setup "${extra_flags[@]}"
 
+  if sudo test -f "$CLIENT_ROLE_CRED"; then
+    log_ok "Role credential present: $CLIENT_ROLE_CRED"
+  fi
+
+  if sudo test -f "$CLIENT_ROLE_CRED"; then
+    log_val "role credential:" "$CLIENT_ROLE_CRED"
+  fi
+
   if sudo test -f "$CLIENT_SERVER_PUB"; then
     local pinned_hex
     pinned_hex="$(sudo xxd -p -c 32 "$CLIENT_SERVER_PUB" 2>/dev/null || true)"
@@ -517,6 +527,7 @@ cmd_status() {
   echo -e "\n${_W}Client state${_N}  ($CLIENT_STATE_DIR)"
   _status_file "$CLIENT_DEVICE_ROOT" "device root"
   _status_file "$CLIENT_SERVER_PUB" "pinned server pub"
+  _status_file "$CLIENT_ROLE_CRED" "role credential"
 
   if sudo test -f "$CLIENT_DEVICE_ROOT"; then
     local derived did dpub
@@ -525,6 +536,10 @@ cmd_status() {
     dpub="$(awk '{print $2}' <<<"$derived")"
     [[ -n "$did" ]] && log_val "device_id:" "$did"
     [[ -n "$dpub" ]] && log_val "device_pub:" "$dpub"
+  fi
+
+  if sudo test -f "$CLIENT_ROLE_CRED"; then
+    log_ok "Role credential present: $CLIENT_ROLE_CRED"
   fi
 
   if sudo test -f "$CLIENT_SERVER_PUB"; then

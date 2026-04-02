@@ -28,6 +28,7 @@ use zeroize::Zeroize;
 type HmacSha256 = Hmac<Sha256>;
 
 const NONCE_LEN: usize = 32;
+const SETUP_CHALLENGE_LEN: usize = 16;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
@@ -38,8 +39,7 @@ const MSG_GOODBYE: u8 = 0x15;
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/client/device_root.bin";
 const SERVER_PUB_FILE: &str = "/var/lib/iot-auth/client/server_pub.bin";
 const OFFLINE_COUNTER_FILE: &str = "/var/lib/iot-auth/client/offline_counter.bin";
-const CLIENT_CONTINUITY_FILE: &str = "/var/lib/iot-auth/client/continuity.bin";
-const SERVER_CONTINUITY_TRACK_FILE: &str = "/var/lib/iot-auth/client/server_continuity_track.bin";
+const ROLE_CRED_FILE: &str = "/var/lib/iot-auth/client/role_cred.bin";
 
 const T_SETUP: &[u8] = b"setup_client_schnorr_v1";
 const T_SETUP_SERVER: &[u8] = b"setup_server_schnorr_v1";
@@ -47,8 +47,7 @@ const T_CLIENT: &[u8] = b"client_schnorr_v1";
 const T_SERVER: &[u8] = b"server_schnorr_v1";
 const T_KC: &[u8] = b"kc_v1";
 const T_OFFLINE: &[u8] = b"offline_schnorr_v1";
-const T_CLIENT_CONT: &[u8] = b"client_continuity_v1";
-const T_SERVER_CONT: &[u8] = b"server_continuity_v1";
+const T_ATTR_ROLE: &[u8] = b"client_attr_role_v1";
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
@@ -56,7 +55,6 @@ const MAX_OFFLINE_FIELD: usize = 256;
 
 const DAEMON_BASE_BACKOFF: Duration = Duration::from_secs(1);
 const DAEMON_MAX_BACKOFF: Duration = Duration::from_secs(30);
-const DEFAULT_CONTINUITY_EXPIRES_IN: u64 = 300;
 const DEFAULT_DAEMON_SUCCESS_SLEEP: Duration = Duration::from_secs(5);
 const HEARTBEAT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_MAX_AGE: Duration = Duration::from_secs(1800);
@@ -66,7 +64,6 @@ const MAX_MISSED_HEARTBEATS: u32 = 3;
 struct ClientDaemonConfig {
     enabled: bool,
     success_sleep: Duration,
-    continuity_expires_in: u64,
 }
 
 impl Default for ClientDaemonConfig {
@@ -74,7 +71,6 @@ impl Default for ClientDaemonConfig {
         Self {
             enabled: false,
             success_sleep: DEFAULT_DAEMON_SUCCESS_SLEEP,
-            continuity_expires_in: DEFAULT_CONTINUITY_EXPIRES_IN,
         }
     }
 }
@@ -101,6 +97,14 @@ impl ReconnectBackoff {
         self.current = std::cmp::min(self.current.saturating_mul(2), self.max);
         out
     }
+}
+
+#[derive(Clone)]
+struct RoleCredential {
+    role_code: u64,
+    role_scalar: Scalar,
+    blind: Scalar,
+    commitment: RistrettoPoint,
 }
 
 struct ClientSession {
@@ -233,6 +237,60 @@ fn random_bytes_32() -> [u8; 32] {
     b
 }
 
+fn hash_to_point(label: &[u8]) -> RistrettoPoint {
+    let mut h = Sha512::new();
+    sha2::Digest::update(&mut h, b"ristretto-hash-to-point-v1");
+    sha2::Digest::update(&mut h, label);
+    let digest = h.finalize();
+
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&digest);
+    RistrettoPoint::from_uniform_bytes(&wide)
+}
+
+fn attr_h() -> RistrettoPoint {
+    hash_to_point(b"iot-auth/attr-h/v1")
+}
+
+fn encode_role(role_code: u64) -> Scalar {
+    Scalar::from(role_code)
+}
+
+fn make_role_commitment(role_scalar: &Scalar, blind: &Scalar) -> RistrettoPoint {
+    let h = attr_h();
+    (RISTRETTO_BASEPOINT_POINT * role_scalar) + (h * blind)
+}
+
+fn prove_role_commitment_opening(
+    role_scalar: &Scalar,
+    blind: &Scalar,
+    commitment: &RistrettoPoint,
+    device_id: &[u8; 32],
+    nonce_c: &[u8; 32],
+    eph_c: &RistrettoPoint,
+) -> (RistrettoPoint, Scalar, Scalar) {
+    let h = attr_h();
+
+    let u = random_scalar();
+    let v = random_scalar();
+    let a = (RISTRETTO_BASEPOINT_POINT * u) + (h * v);
+
+    let c = transcript_challenge_scalar(
+        T_ATTR_ROLE,
+        &[
+            (b"device_id", TranscriptValue::Bytes(device_id)),
+            (b"commitment", TranscriptValue::Point(commitment)),
+            (b"a", TranscriptValue::Point(&a)),
+            (b"nonce_c", TranscriptValue::Bytes(nonce_c)),
+            (b"eph_c", TranscriptValue::Point(eph_c)),
+        ],
+    );
+
+    let s_attr = u + c * role_scalar;
+    let s_blind = v + c * blind;
+    (a, s_attr, s_blind)
+}
+
 /// Rejects the neutral Ristretto point so invalid or low-order inputs are not accepted.
 fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     if *p == RistrettoPoint::default() {
@@ -244,6 +302,76 @@ fn reject_identity(p: &RistrettoPoint, what: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn save_role_credential(cred: &RoleCredential) -> std::io::Result<()> {
+    let mut out = Vec::with_capacity(8 + 32 + 32);
+    out.extend_from_slice(&cred.role_code.to_le_bytes());
+    out.extend_from_slice(&cred.blind.to_bytes());
+    out.extend_from_slice(cred.commitment.compress().as_bytes());
+    write_private_file_atomic(ROLE_CRED_FILE, &out)
+}
+
+fn load_role_credential() -> std::io::Result<RoleCredential> {
+    verify_private_file_permissions(ROLE_CRED_FILE)?;
+    let data = fs::read(ROLE_CRED_FILE)?;
+    if data.len() != 72 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "role_cred.bin wrong length",
+        ));
+    }
+
+    let mut role_code_bytes = [0u8; 8];
+    role_code_bytes.copy_from_slice(&data[0..8]);
+    let role_code = u64::from_le_bytes(role_code_bytes);
+    let role_scalar = encode_role(role_code);
+
+    let mut blind_bytes = [0u8; 32];
+    blind_bytes.copy_from_slice(&data[8..40]);
+    let blind = Option::from(Scalar::from_canonical_bytes(blind_bytes))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "role blind not canonical"))?;
+
+    let mut commitment_bytes = [0u8; 32];
+    commitment_bytes.copy_from_slice(&data[40..72]);
+    let commitment = CompressedRistretto(commitment_bytes)
+        .decompress()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "role commitment invalid"))?;
+    reject_identity(&commitment, "role commitment")?;
+
+    let expected = make_role_commitment(&role_scalar, &blind);
+    if expected.compress().to_bytes() != commitment.compress().to_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "role credential commitment mismatch",
+        ));
+    }
+
+    Ok(RoleCredential {
+        role_code,
+        role_scalar,
+        blind,
+        commitment,
+    })
+}
+
+fn load_or_create_role_credential() -> std::io::Result<RoleCredential> {
+    if Path::new(ROLE_CRED_FILE).exists() {
+        return load_role_credential();
+    }
+
+    let role_code = 1u64;
+    let role_scalar = encode_role(role_code);
+    let blind = random_scalar();
+    let commitment = make_role_commitment(&role_scalar, &blind);
+    let cred = RoleCredential {
+        role_code,
+        role_scalar,
+        blind,
+        commitment,
+    };
+    save_role_credential(&cred)?;
+    Ok(cred)
+}
+
 /// Creates the client setup proof used during raw-public-key enrollment.
 fn schnorr_prove_setup(
     x: &Scalar,
@@ -252,6 +380,7 @@ fn schnorr_prove_setup(
     server_static_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    setup_challenge: &[u8; SETUP_CHALLENGE_LEN],
 ) -> (RistrettoPoint, Scalar) {
     let r = random_scalar();
     let a = RISTRETTO_BASEPOINT_POINT * r;
@@ -265,6 +394,7 @@ fn schnorr_prove_setup(
             (b"a", TranscriptValue::Point(&a)),
             (b"client_nonce", TranscriptValue::Bytes(client_nonce)),
             (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
+            (b"setup_challenge", TranscriptValue::Bytes(setup_challenge)),
         ],
     );
     let s = r + c * x;
@@ -278,6 +408,7 @@ fn schnorr_verify_setup_server(
     device_pub: &RistrettoPoint,
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
+    setup_challenge: &[u8; SETUP_CHALLENGE_LEN],
     a: &RistrettoPoint,
     s: &Scalar,
 ) -> bool {
@@ -291,6 +422,7 @@ fn schnorr_verify_setup_server(
             (b"a", TranscriptValue::Point(a)),
             (b"client_nonce", TranscriptValue::Bytes(client_nonce)),
             (b"server_nonce", TranscriptValue::Bytes(server_nonce)),
+            (b"setup_challenge", TranscriptValue::Bytes(setup_challenge)),
         ],
     );
     RISTRETTO_BASEPOINT_POINT * s == a + server_static_pub * c
@@ -619,6 +751,7 @@ fn do_setup(
     let device_static_pub = RISTRETTO_BASEPOINT_POINT * x;
     reject_identity(&device_static_pub, "client device_static_pub")?;
     let device_pub_bytes = device_static_pub.compress().to_bytes();
+    let role_cred = load_or_create_role_credential()?;
 
     let pinned_server_pub = load_server_pub()?;
     if pinned_server_pub.is_none() && !allow_tofu_setup {
@@ -654,10 +787,13 @@ fn do_setup(
     send_all(&mut stream, &device_id, &mut sent)?;
     send_all(&mut stream, &device_pub_bytes, &mut sent)?;
     send_all(&mut stream, &client_nonce, &mut sent)?;
+    send_all(&mut stream, role_cred.commitment.compress().as_bytes(), &mut sent)?;
     stream.flush()?;
 
     let mut server_nonce = [0u8; 32];
     recv_exact(&mut stream, &mut server_nonce, &mut recv)?;
+    let mut setup_challenge = [0u8; SETUP_CHALLENGE_LEN];
+    recv_exact(&mut stream, &mut setup_challenge, &mut recv)?;
     let mut server_pub_bytes = [0u8; 32];
     recv_exact(&mut stream, &mut server_pub_bytes, &mut recv)?;
     let server_static_pub = CompressedRistretto(server_pub_bytes)
@@ -691,6 +827,7 @@ fn do_setup(
         &device_static_pub,
         &client_nonce,
         &server_nonce,
+        &setup_challenge,
         &a_s,
         &s_s,
     ) {
@@ -707,6 +844,7 @@ fn do_setup(
         &server_static_pub,
         &client_nonce,
         &server_nonce,
+        &setup_challenge,
     );
 
     send_all(&mut stream, a.compress().as_bytes(), &mut sent)?;
@@ -737,7 +875,7 @@ fn do_setup(
 
 /// Runs the client-side authenticated session handshake, including the X25519 tunnel, Schnorr proof exchange, session-key derivation, and key confirmation.
 /// Step 1: require a pinned server key before attempting online authentication.
-fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar, continuity_expires_in: u64) -> std::io::Result<ClientSession> {
+fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<ClientSession> {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv = 0usize;
@@ -793,13 +931,26 @@ fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar, con
     let mut eph_secret = random_scalar();
     let eph_pub = RISTRETTO_BASEPOINT_POINT * eph_secret;
     let (a_c, s_c) = schnorr_prove_auth(&x, &device_id, &nonce_c, &eph_pub);
+    let role_cred = load_or_create_role_credential()?;
+    let (attr_a, attr_s_attr, attr_s_blind) = prove_role_commitment_opening(
+        &role_cred.role_scalar,
+        &role_cred.blind,
+        &role_cred.commitment,
+        &device_id,
+        &nonce_c,
+        &eph_pub,
+    );
 
-    let mut payload1 = Vec::with_capacity(160);
+    let mut payload1 = Vec::with_capacity(288);
     payload1.extend_from_slice(&device_id);
     payload1.extend_from_slice(a_c.compress().as_bytes());
     payload1.extend_from_slice(&s_c.to_bytes());
     payload1.extend_from_slice(&nonce_c);
     payload1.extend_from_slice(eph_pub.compress().as_bytes());
+    payload1.extend_from_slice(role_cred.commitment.compress().as_bytes());
+    payload1.extend_from_slice(attr_a.compress().as_bytes());
+    payload1.extend_from_slice(&attr_s_attr.to_bytes());
+    payload1.extend_from_slice(&attr_s_blind.to_bytes());
 
     let ct1 = cipher_tx
         .encrypt(&nonce_tx_ctr.next(), payload1.as_ref())
@@ -886,27 +1037,6 @@ fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar, con
     send_blob(&mut stream, &ct3, &mut sent)?;
     stream.flush()?;
 
-    println!("Client[CONT]: preparing pending continuity state");
-    let (client_continuity_proof, pending_client_state) = prepare_client_continuity_proof(device_id, &x, continuity_expires_in)?;
-    let client_continuity_blob = client_continuity_proof.serialize();
-    println!("Client[CONT]: sending client continuity proof");
-    let ct4 = cipher_tx
-        .encrypt(&nonce_tx_ctr.next(), client_continuity_blob.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "continuity proof encryption failed"))?;
-    send_blob(&mut stream, &ct4, &mut sent)?;
-    stream.flush()?;
-
-    let rx_ct3 = recv_encrypted_blob(&mut stream, &mut recv)?;
-    let server_continuity_plain = cipher_rx
-        .decrypt(&nonce_rx_ctr.next(), rx_ct3.as_ref())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "decryption failed on server continuity proof"))?;
-    let server_continuity_proof = ContinuityProof::deserialize(&server_continuity_plain)?;
-    let verified_server_track = verify_server_continuity_proof(&server_continuity_proof, false)?;
-    println!("Client[CONT]: server continuity proof verified");
-
-    save_client_continuity_state(&pending_client_state)?;
-    save_server_track(&verified_server_track)?;
-    println!("Client[CONT]: committing continuity state");
 
     println!("Client[AUTH]: Sent encrypted client finished tag");
 
@@ -936,8 +1066,8 @@ fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar, con
     })
 }
 
-fn do_auth_v2(server_addr: &str, device_id: [u8; 32], x: Scalar, continuity_expires_in: u64) -> std::io::Result<()> {
-    let mut sess = do_auth_v2_session(server_addr, device_id, x, continuity_expires_in)?;
+fn do_auth_v2(server_addr: &str, device_id: [u8; 32], x: Scalar) -> std::io::Result<()> {
+    let mut sess = do_auth_v2_session(server_addr, device_id, x)?;
     let goodbye = [MSG_GOODBYE];
     let _ = sess.send_encrypted(&goodbye);
     Ok(())
@@ -1021,363 +1151,6 @@ impl OfflineProof {
         out.extend_from_slice(&self.s);
         Ok(out)
     }
-}
-
-#[derive(Clone, Debug)]
-/// Stores continuity-tracking state that links one successful session to the next.
-struct ContinuityState {
-    version: u8,
-    role: u8,
-    identity: [u8; 32],
-    pubkey: [u8; 32],
-    continuity_counter: u64,
-    reconnect_epoch: u64,
-    last_peer_id: [u8; 32],
-    last_checkpoint_hash: [u8; 32],
-    state_hash: [u8; 32],
-}
-
-#[derive(Clone, Debug)]
-/// Represents a continuity proof used to bind reconnects to prior state.
-struct ContinuityProof {
-    version: u8,
-    role: u8,
-    identity: [u8; 32],
-    pubkey: [u8; 32],
-    peer_id: [u8; 32],
-    issued_at: u64,
-    expires_at: u64,
-    continuity_counter: u64,
-    reconnect_epoch: u64,
-    prev_checkpoint_hash: [u8; 32],
-    state_hash: [u8; 32],
-    checkpoint_hash: [u8; 32],
-    a: [u8; 32],
-    s: [u8; 32],
-}
-
-/// Stores continuity-tracking state that links one successful session to the next.
-impl ContinuityState {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(178);
-        out.push(self.version);
-        out.push(self.role);
-        out.extend_from_slice(&self.identity);
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&self.continuity_counter.to_le_bytes());
-        out.extend_from_slice(&self.reconnect_epoch.to_le_bytes());
-        out.extend_from_slice(&self.last_peer_id);
-        out.extend_from_slice(&self.last_checkpoint_hash);
-        out.extend_from_slice(&self.state_hash);
-        out
-    }
-
-    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
-        if buf.len() != 178 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity state wrong length"));
-        }
-        let mut off = 0usize;
-        let version = buf[off]; off += 1;
-        let role = buf[off]; off += 1;
-        let mut identity = [0u8; 32]; identity.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut pubkey = [0u8; 32]; pubkey.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let continuity_counter = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()); off += 8;
-        let reconnect_epoch = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()); off += 8;
-        let mut last_peer_id = [0u8; 32]; last_peer_id.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut last_checkpoint_hash = [0u8; 32]; last_checkpoint_hash.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut state_hash = [0u8; 32]; state_hash.copy_from_slice(&buf[off..off + 32]);
-        Ok(Self { version, role, identity, pubkey, continuity_counter, reconnect_epoch, last_peer_id, last_checkpoint_hash, state_hash })
-    }
-}
-
-/// Represents a continuity proof used to bind reconnects to prior state.
-impl ContinuityProof {
-    fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(290);
-        out.push(self.version);
-        out.push(self.role);
-        out.extend_from_slice(&self.identity);
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&self.peer_id);
-        out.extend_from_slice(&self.issued_at.to_le_bytes());
-        out.extend_from_slice(&self.expires_at.to_le_bytes());
-        out.extend_from_slice(&self.continuity_counter.to_le_bytes());
-        out.extend_from_slice(&self.reconnect_epoch.to_le_bytes());
-        out.extend_from_slice(&self.prev_checkpoint_hash);
-        out.extend_from_slice(&self.state_hash);
-        out.extend_from_slice(&self.checkpoint_hash);
-        out.extend_from_slice(&self.a);
-        out.extend_from_slice(&self.s);
-        out
-    }
-
-    fn deserialize(buf: &[u8]) -> std::io::Result<Self> {
-        if buf.len() != 290 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity proof wrong length"));
-        }
-        let mut off = 0usize;
-        let version = buf[off]; off += 1;
-        let role = buf[off]; off += 1;
-        let mut identity = [0u8; 32]; identity.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut pubkey = [0u8; 32]; pubkey.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut peer_id = [0u8; 32]; peer_id.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let issued_at = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()); off += 8;
-        let expires_at = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()); off += 8;
-        let continuity_counter = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()); off += 8;
-        let reconnect_epoch = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()); off += 8;
-        let mut prev_checkpoint_hash = [0u8; 32]; prev_checkpoint_hash.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut state_hash = [0u8; 32]; state_hash.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut checkpoint_hash = [0u8; 32]; checkpoint_hash.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut a = [0u8; 32]; a.copy_from_slice(&buf[off..off + 32]); off += 32;
-        let mut s = [0u8; 32]; s.copy_from_slice(&buf[off..off + 32]);
-        Ok(Self { version, role, identity, pubkey, peer_id, issued_at, expires_at, continuity_counter, reconnect_epoch, prev_checkpoint_hash, state_hash, checkpoint_hash, a, s })
-    }
-}
-
-/// Hashes the client continuity state that is chained across reconnects.
-fn hash_client_continuity_state(
-    identity: &[u8; 32],
-    pubkey: &[u8; 32],
-    pinned_server_pub: &[u8; 32],
-    continuity_counter: u64,
-    reconnect_epoch: u64,
-) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"client-state-v1");
-    sha2::Digest::update(&mut h, identity);
-    sha2::Digest::update(&mut h, pubkey);
-    sha2::Digest::update(&mut h, pinned_server_pub);
-    sha2::Digest::update(&mut h, &continuity_counter.to_le_bytes());
-    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Hashes the server-side tracking state associated with a client continuity chain.
-fn hash_server_track_state(peer_id: &[u8; 32], highest_counter: u64, reconnect_epoch: u64, checkpoint_hash: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"server-track-v1");
-    sha2::Digest::update(&mut h, peer_id);
-    sha2::Digest::update(&mut h, &highest_counter.to_le_bytes());
-    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
-    sha2::Digest::update(&mut h, checkpoint_hash);
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Derives the next continuity checkpoint hash from the previous checkpoint and current state.
-fn next_checkpoint_hash(prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], continuity_counter: u64, reconnect_epoch: u64, peer_id: &[u8; 32]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"continuity-checkpoint-v1");
-    sha2::Digest::update(&mut h, prev_checkpoint_hash);
-    sha2::Digest::update(&mut h, state_hash);
-    sha2::Digest::update(&mut h, &continuity_counter.to_le_bytes());
-    sha2::Digest::update(&mut h, &reconnect_epoch.to_le_bytes());
-    sha2::Digest::update(&mut h, peer_id);
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Builds the Schnorr-style challenge scalar used for continuity proofs.
-fn continuity_challenge_scalar(domain: &[u8], role: u8, identity: &[u8; 32], pubkey: &RistrettoPoint, peer_id: &[u8; 32], issued_at: u64, expires_at: u64, continuity_counter: u64, reconnect_epoch: u64, prev_checkpoint_hash: &[u8; 32], state_hash: &[u8; 32], checkpoint_hash: &[u8; 32], a: &RistrettoPoint) -> Scalar {
-    transcript_challenge_scalar(
-        domain,
-        &[
-            (b"role", TranscriptValue::U8(role)),
-            (b"identity", TranscriptValue::Bytes(identity)),
-            (b"pubkey", TranscriptValue::Point(pubkey)),
-            (b"peer_id", TranscriptValue::Bytes(peer_id)),
-            (b"issued_at", TranscriptValue::U64(issued_at)),
-            (b"expires_at", TranscriptValue::U64(expires_at)),
-            (b"continuity_counter", TranscriptValue::U64(continuity_counter)),
-            (b"reconnect_epoch", TranscriptValue::U64(reconnect_epoch)),
-            (b"prev_checkpoint_hash", TranscriptValue::Bytes(prev_checkpoint_hash)),
-            (b"state_hash", TranscriptValue::Bytes(state_hash)),
-            (b"checkpoint_hash", TranscriptValue::Bytes(checkpoint_hash)),
-            (b"a", TranscriptValue::Point(a)),
-        ],
-    )
-}
-
-/// Derives a stable server peer identifier from the pinned server public key.
-fn server_peer_id_from_pinned_pub(p: &RistrettoPoint) -> [u8; 32] {
-    let mut h = Sha256::new();
-    sha2::Digest::update(&mut h, b"server-id-v1");
-    sha2::Digest::update(&mut h, p.compress().as_bytes());
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out);
-    r
-}
-
-/// Loads the client continuity state from disk or initializes a fresh chain.
-fn load_or_init_client_continuity_state(device_id: &[u8; 32], x: &Scalar, pinned_server_pub: &RistrettoPoint) -> std::io::Result<ContinuityState> {
-    let pubkey = (RISTRETTO_BASEPOINT_POINT * x).compress().to_bytes();
-    let peer_id = server_peer_id_from_pinned_pub(pinned_server_pub);
-    if Path::new(CLIENT_CONTINUITY_FILE).exists() {
-        verify_private_file_permissions(CLIENT_CONTINUITY_FILE)?;
-        let st = ContinuityState::deserialize(&fs::read(CLIENT_CONTINUITY_FILE)?)?;
-        if st.identity != *device_id || st.pubkey != pubkey {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "client continuity state mismatch"));
-        }
-        return Ok(st);
-    }
-    let state_hash = hash_client_continuity_state(device_id, &pubkey, pinned_server_pub.compress().as_bytes(), 0, 0);
-    let st = ContinuityState {
-        version: 1,
-        role: 1,
-        identity: *device_id,
-        pubkey,
-        continuity_counter: 0,
-        reconnect_epoch: 0,
-        last_peer_id: peer_id,
-        last_checkpoint_hash: [0u8; 32],
-        state_hash,
-    };
-    write_private_file_atomic(CLIENT_CONTINUITY_FILE, &st.serialize())?;
-    Ok(st)
-}
-
-/// Persists the client continuity state to disk.
-fn save_client_continuity_state(st: &ContinuityState) -> std::io::Result<()> {
-    write_private_file_atomic(CLIENT_CONTINUITY_FILE, &st.serialize())
-}
-
-/// Loads the last server continuity track recorded by the client.
-fn load_server_track() -> std::io::Result<Option<ContinuityState>> {
-    if !Path::new(SERVER_CONTINUITY_TRACK_FILE).exists() {
-        return Ok(None);
-    }
-    verify_private_file_permissions(SERVER_CONTINUITY_TRACK_FILE)?;
-    Ok(Some(ContinuityState::deserialize(&fs::read(SERVER_CONTINUITY_TRACK_FILE)?)?))
-}
-
-/// Persists the server continuity track recorded by the client.
-fn save_server_track(st: &ContinuityState) -> std::io::Result<()> {
-    write_private_file_atomic(SERVER_CONTINUITY_TRACK_FILE, &st.serialize())
-}
-
-/// Builds a candidate client continuity proof without persisting the new local state yet.
-fn prepare_client_continuity_proof(device_id: [u8; 32], x: &Scalar, expires_in: u64) -> std::io::Result<(ContinuityProof, ContinuityState)> {
-    if expires_in == 0 || expires_in > 300 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in must be between 1 and 300"));
-    }
-    let pinned_server_pub = load_server_pub()?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no pinned server pub for continuity"))?;
-    let current = load_or_init_client_continuity_state(&device_id, x, &pinned_server_pub)?;
-    let mut pending = current.clone();
-    pending.continuity_counter = pending.continuity_counter.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity counter exhausted"))?;
-    pending.reconnect_epoch = pending.reconnect_epoch.checked_add(1).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "reconnect epoch exhausted"))?;
-    pending.state_hash = hash_client_continuity_state(&pending.identity, &pending.pubkey, pinned_server_pub.compress().as_bytes(), pending.continuity_counter, pending.reconnect_epoch);
-
-    let pubkey_point = RISTRETTO_BASEPOINT_POINT * x;
-    let checkpoint_hash = next_checkpoint_hash(&current.last_checkpoint_hash, &pending.state_hash, pending.continuity_counter, pending.reconnect_epoch, &pending.last_peer_id);
-    let issued_at = unix_time_now()?;
-    let expires_at = issued_at.checked_add(expires_in).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "expires_at overflow"))?;
-    let r = random_scalar();
-    let a = RISTRETTO_BASEPOINT_POINT * r;
-    let c = continuity_challenge_scalar(T_CLIENT_CONT, pending.role, &pending.identity, &pubkey_point, &pending.last_peer_id, issued_at, expires_at, pending.continuity_counter, pending.reconnect_epoch, &current.last_checkpoint_hash, &pending.state_hash, &checkpoint_hash, &a);
-    let s = r + c * x;
-    let proof = ContinuityProof {
-        version: 1,
-        role: pending.role,
-        identity: pending.identity,
-        pubkey: pending.pubkey,
-        peer_id: pending.last_peer_id,
-        issued_at,
-        expires_at,
-        continuity_counter: pending.continuity_counter,
-        reconnect_epoch: pending.reconnect_epoch,
-        prev_checkpoint_hash: current.last_checkpoint_hash,
-        state_hash: pending.state_hash,
-        checkpoint_hash,
-        a: a.compress().to_bytes(),
-        s: s.to_bytes(),
-    };
-    pending.last_checkpoint_hash = checkpoint_hash;
-    Ok((proof, pending))
-}
-
-/// Builds a client continuity proof and persists the new local state.
-fn build_client_continuity_proof(device_id: [u8; 32], x: &Scalar, expires_in: u64) -> std::io::Result<(ContinuityProof, ContinuityState)> {
-    let (proof, pending) = prepare_client_continuity_proof(device_id, x, expires_in)?;
-    save_client_continuity_state(&pending)?;
-    Ok((proof, pending))
-}
-
-/// Verifies a server continuity proof and optionally persists the updated tracked state.
-fn verify_server_continuity_proof(proof: &ContinuityProof, persist: bool) -> std::io::Result<ContinuityState> {
-    let pinned_server_pub = load_server_pub()?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no pinned server pub for continuity verification"))?;
-    let expected_identity = server_peer_id_from_pinned_pub(&pinned_server_pub);
-    if proof.role != 2 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "proof is not a server continuity proof"));
-    }
-    if proof.identity != expected_identity {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity identity mismatch"));
-    }
-    if proof.pubkey.ct_eq(pinned_server_pub.compress().as_bytes()).unwrap_u8() == 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity pubkey mismatch"));
-    }
-    let (device_id, _x) = load_device_creds_from_root()?;
-    if proof.peer_id != device_id {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity peer binding mismatch"));
-    }
-    let mut track = load_server_track()?.unwrap_or(ContinuityState {
-        version: 1, role: 2, identity: expected_identity, pubkey: pinned_server_pub.compress().to_bytes(),
-        continuity_counter: 0, reconnect_epoch: 0, last_peer_id: device_id, last_checkpoint_hash: [0u8; 32],
-        state_hash: hash_server_track_state(&device_id, 0, 0, &[0u8; 32]),
-    });
-    let now = unix_time_now()?;
-    if proof.issued_at >= proof.expires_at || now < proof.issued_at || now > proof.expires_at {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity proof expired or not yet valid"));
-    }
-    if proof.continuity_counter <= track.continuity_counter {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity replay detected"));
-    }
-    if proof.prev_checkpoint_hash != track.last_checkpoint_hash {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity checkpoint chain mismatch"));
-    }
-    let recomputed_checkpoint = next_checkpoint_hash(&proof.prev_checkpoint_hash, &proof.state_hash, proof.continuity_counter, proof.reconnect_epoch, &proof.peer_id);
-    if recomputed_checkpoint != proof.checkpoint_hash {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity checkpoint hash mismatch"));
-    }
-    let a = CompressedRistretto(proof.a).decompress().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity A invalid"))?;
-    reject_identity(&a, "server continuity A")?;
-    let s: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(proof.s)).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "continuity s non-canonical"))?;
-    let c = continuity_challenge_scalar(T_SERVER_CONT, proof.role, &proof.identity, &pinned_server_pub, &proof.peer_id, proof.issued_at, proof.expires_at, proof.continuity_counter, proof.reconnect_epoch, &proof.prev_checkpoint_hash, &proof.state_hash, &proof.checkpoint_hash, &a);
-    if RISTRETTO_BASEPOINT_POINT * s != a + (pinned_server_pub * c) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "server continuity Schnorr proof invalid"));
-    }
-    track.continuity_counter = proof.continuity_counter;
-    track.reconnect_epoch = proof.reconnect_epoch;
-    track.last_checkpoint_hash = proof.checkpoint_hash;
-    track.state_hash = hash_server_track_state(&proof.peer_id, track.continuity_counter, track.reconnect_epoch, &track.last_checkpoint_hash);
-    if persist {
-        save_server_track(&track)?;
-    }
-    Ok(track)
-}
-
-/// Parses and verifies a server continuity proof file using the pinned server identity.
-fn verify_server_continuity_proof_from_file(path: &str) -> std::io::Result<()> {
-    let proof = ContinuityProof::deserialize(&fs::read(path)?)?;
-    let track = verify_server_continuity_proof(&proof, true)?;
-    println!("Client[CONTINUITY]: verified returning server continuity proof file={} counter={} reconnect_epoch={}", path, track.continuity_counter, track.reconnect_epoch);
-    Ok(())
-}
-
-/// Creates a client continuity proof file from the current local state.
-fn do_make_client_continuity_proof(output_path: &str, device_id: [u8; 32], mut x: Scalar, expires_in: u64) -> std::io::Result<()> {
-    let (proof, st) = build_client_continuity_proof(device_id, &x, expires_in)?;
-    write_private_file_atomic(output_path, &proof.serialize())?;
-    println!("Client[CONTINUITY]: wrote client continuity proof to {} counter={} reconnect_epoch={} checkpoint_hash={}", output_path, st.continuity_counter, st.reconnect_epoch, hex::encode(proof.checkpoint_hash));
-    x.zeroize();
-    Ok(())
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -1563,12 +1336,10 @@ fn usage(prog: &str) {
         "Usage:
   {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup (debug-only)]
   {0} --server 127.0.0.1:4000
-  {0} --server 127.0.0.1:4000 --daemon [--daemon-interval-secs N] [--continuity-expires-in <1..300>]
+  {0} --server 127.0.0.1:4000 --daemon [--daemon-interval-secs N]
   {0} --pin-server-pub <hex>
   {0} --print-device-identity
-  {0} --make-offline-proof <file> --audience <name> --scope <scope> [--offline-expires-in <1..300>] [--request-hash <hex>|--request-file <path>]
-  {0} --make-client-continuity-proof <file> [--continuity-expires-in <1..300>]
-  {0} --verify-server-continuity-proof <file>",
+  {0} --make-offline-proof <file> --audience <name> --scope <scope> [--offline-expires-in <1..300>] [--request-hash <hex>|--request-file <path>]",
         prog
     );
 }
@@ -1599,11 +1370,11 @@ fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scal
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical scalar"))
 }
 
-fn run_client_daemon(server_addr: &str, device_id: [u8; 32], heartbeat_interval: Duration, continuity_expires_in: u64) -> std::io::Result<()> {
+fn run_client_daemon(server_addr: &str, device_id: [u8; 32], heartbeat_interval: Duration) -> std::io::Result<()> {
     let mut backoff = ReconnectBackoff::new(DAEMON_BASE_BACKOFF, DAEMON_MAX_BACKOFF);
     loop {
         let (_, x) = load_device_creds_from_root()?;
-        match do_auth_v2_session(server_addr, device_id, x, continuity_expires_in) {
+        match do_auth_v2_session(server_addr, device_id, x) {
             Ok(session) => {
                 backoff.reset(DAEMON_BASE_BACKOFF);
                 match run_online_session(session, heartbeat_interval) {
@@ -1634,9 +1405,6 @@ fn main() -> std::io::Result<()> {
     let mut offline_scope: Option<String> = None;
     let mut offline_expires_in: u64 = 300;
     let mut offline_request_hash: Option<[u8; 32]> = None;
-    let mut continuity_output: Option<String> = None;
-    let mut verify_server_continuity_path: Option<String> = None;
-    let mut continuity_expires_in: u64 = DEFAULT_CONTINUITY_EXPIRES_IN;
     let mut daemon_cfg = ClientDaemonConfig::default();
 
     let mut i = 1;
@@ -1673,16 +1441,6 @@ fn main() -> std::io::Result<()> {
                 offline_output = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--make-client-continuity-proof" => {
-                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-client-continuity-proof missing value")); }
-                continuity_output = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--verify-server-continuity-proof" => {
-                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--verify-server-continuity-proof missing value")); }
-                verify_server_continuity_path = Some(args[i + 1].clone());
-                i += 2;
-            }
             "--audience" => {
                 if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--audience missing value")); }
                 offline_audience = Some(args[i + 1].clone());
@@ -1696,12 +1454,6 @@ fn main() -> std::io::Result<()> {
             "--offline-expires-in" => {
                 if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--offline-expires-in missing value")); }
                 offline_expires_in = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --offline-expires-in"))?;
-                i += 2;
-            }
-            "--continuity-expires-in" => {
-                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--continuity-expires-in missing value")); }
-                continuity_expires_in = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --continuity-expires-in"))?;
-                daemon_cfg.continuity_expires_in = continuity_expires_in;
                 i += 2;
             }
             "--request-hash" => {
@@ -1734,19 +1486,12 @@ fn main() -> std::io::Result<()> {
     }
 
     if print_identity { return print_device_identity(); }
-    if let Some(path) = verify_server_continuity_path.as_deref() { return verify_server_continuity_proof_from_file(path); }
-
     if let Some(output_path) = offline_output.as_deref() {
         let audience = offline_audience.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --audience"))?;
         let scope = offline_scope.as_deref().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --scope"))?;
         let request_hash = offline_request_hash.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "--make-offline-proof requires --request-hash or --request-file"))?;
         let (device_id, x) = load_device_creds_from_root()?;
         return do_make_offline_proof(output_path, device_id, x, audience, scope, offline_expires_in, request_hash);
-    }
-
-    if let Some(output_path) = continuity_output.as_deref() {
-        let (device_id, x) = load_device_creds_from_root()?;
-        return do_make_client_continuity_proof(output_path, device_id, x, continuity_expires_in);
     }
 
     if Path::new(DEVICE_ROOT_FILE).exists() { verify_private_file_permissions(DEVICE_ROOT_FILE)?; }
@@ -1764,8 +1509,8 @@ fn main() -> std::io::Result<()> {
         println!("Client[SETUP/RPK]: {}", if had_root_before { "Using existing device root for setup (idempotent)." } else { "No device root found; generating NEW device root." });
         do_setup(&server_addr, device_id, x, pairing_token.as_deref(), allow_tofu_setup)
     } else if daemon_cfg.enabled {
-        run_client_daemon(&server_addr, device_id, daemon_cfg.success_sleep, daemon_cfg.continuity_expires_in)
+        run_client_daemon(&server_addr, device_id, daemon_cfg.success_sleep)
     } else {
-        do_auth_v2(&server_addr, device_id, x, continuity_expires_in)
+        do_auth_v2(&server_addr, device_id, x)
     }
 }
