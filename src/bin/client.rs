@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::net::TcpStream;
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blake2::digest::{Update, VariableOutput};
@@ -32,8 +31,6 @@ const SETUP_CHALLENGE_LEN: usize = 16;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
-const MSG_HEARTBEAT: u8 = 0x10;
-const MSG_HEARTBEAT_ACK: u8 = 0x11;
 const MSG_GOODBYE: u8 = 0x15;
 
 const DEVICE_ROOT_FILE: &str = "/var/lib/iot-auth/client/device_root.bin";
@@ -53,88 +50,6 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
 const MAX_OFFLINE_FIELD: usize = 256;
 
-const DAEMON_BASE_BACKOFF: Duration = Duration::from_secs(1);
-const DAEMON_MAX_BACKOFF: Duration = Duration::from_secs(30);
-const DEFAULT_DAEMON_SUCCESS_SLEEP: Duration = Duration::from_secs(5);
-const HEARTBEAT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-const SESSION_MAX_AGE: Duration = Duration::from_secs(1800);
-const MAX_MISSED_HEARTBEATS: u32 = 3;
-
-#[derive(Clone, Debug)]
-struct ClientDaemonConfig {
-    enabled: bool,
-    success_sleep: Duration,
-}
-
-impl Default for ClientDaemonConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            success_sleep: DEFAULT_DAEMON_SUCCESS_SLEEP,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ReconnectBackoff {
-    current: Duration,
-    max: Duration,
-}
-
-impl ReconnectBackoff {
-    fn new(base: Duration, max: Duration) -> Self {
-        Self { current: base, max }
-    }
-
-    fn reset(&mut self, base: Duration) {
-        self.current = base;
-    }
-
-    fn next_delay(&mut self) -> Duration {
-        let base_ms = self.current.as_millis() as u64;
-        let jitter_ms = if base_ms == 0 { 0 } else { (OsRng.next_u32() as u64) % (base_ms / 2 + 1) };
-        let out = self.current.saturating_add(Duration::from_millis(jitter_ms));
-        self.current = std::cmp::min(self.current.saturating_mul(2), self.max);
-        out
-    }
-}
-
-#[derive(Clone)]
-struct RoleCredential {
-    role_code: u64,
-    role_scalar: Scalar,
-    blind: Scalar,
-    commitment: RistrettoPoint,
-}
-
-struct ClientSession {
-    stream: TcpStream,
-    cipher_tx: ChaCha20Poly1305,
-    cipher_rx: ChaCha20Poly1305,
-    nonce_tx_ctr: NonceCounter,
-    nonce_rx_ctr: NonceCounter,
-    established_at: Instant,
-    sent: usize,
-    recv: usize,
-}
-
-impl ClientSession {
-    fn send_encrypted(&mut self, payload: &[u8]) -> std::io::Result<()> {
-        let ct = self.cipher_tx
-            .encrypt(&self.nonce_tx_ctr.next(), payload)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "session encryption failed"))?;
-        send_blob(&mut self.stream, &ct, &mut self.sent)?;
-        self.stream.flush()?;
-        Ok(())
-    }
-
-    fn recv_encrypted(&mut self) -> std::io::Result<Vec<u8>> {
-        let ct = recv_encrypted_blob(&mut self.stream, &mut self.recv)?;
-        self.cipher_rx
-            .decrypt(&self.nonce_rx_ctr.next(), ct.as_ref())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "session decryption failed"))
-    }
-}
 
 /// Tracks a monotonically increasing AEAD nonce counter so each encryption uses a unique 96-bit nonce.
 struct NonceCounter {
@@ -154,6 +69,15 @@ impl NonceCounter {
         bytes[..8].copy_from_slice(&n.to_le_bytes());
         *Nonce::from_slice(&bytes)
     }
+}
+
+
+#[derive(Clone)]
+struct RoleCredential {
+    role_code: u64,
+    role_scalar: Scalar,
+    blind: Scalar,
+    commitment: RistrettoPoint,
 }
 
 /// Builds a deterministic, C-compatible transcript buffer that is later hashed into protocol challenges.
@@ -766,7 +690,7 @@ fn do_setup(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    println!("Client[SETUP/RPK]: Connected to {}", server_addr);
+    println!("Client[SETUP]: Connected to {}", server_addr);
 
     let client_nonce = random_bytes_32();
     send_all(&mut stream, &[MSG_SETUP], &mut sent)?;
@@ -818,7 +742,7 @@ fn do_setup(
         }
     } else {
         save_server_pub(&server_static_pub)?;
-        println!("Client[SETUP/RPK]: TOFU pin accepted for server public key");
+        println!("Client[SETUP]: TOFU pin accepted for server public key");
     }
 
     if !schnorr_verify_setup_server(
@@ -861,12 +785,16 @@ fn do_setup(
     }
 
     save_server_pub(&server_static_pub)?;
+    println!("Client[SETUP]: Enrollment OK");
     println!(
-        "Client[SETUP/RPK]: enrollment OK; server_pub={} elapsed={:?} sent={} recv={}",
-        hex::encode(server_pub_bytes),
+        "CLIENT METRICS -> Duration: {:?}, Sent: {} bytes, Received: {} bytes",
         start.elapsed(),
         sent,
         recv
+    );
+    println!(
+        "Client[SETUP]: Server public key pinned: {}",
+        hex::encode(server_pub_bytes)
     );
 
     x.zeroize();
@@ -875,7 +803,7 @@ fn do_setup(
 
 /// Runs the client-side authenticated session handshake, including the X25519 tunnel, Schnorr proof exchange, session-key derivation, and key confirmation.
 /// Step 1: require a pinned server key before attempting online authentication.
-fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<ClientSession> {
+fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> std::io::Result<()> {
     let start = Instant::now();
     let mut sent = 0usize;
     let mut recv = 0usize;
@@ -1054,60 +982,12 @@ fn do_auth_v2_session(server_addr: &str, device_id: [u8; 32], mut x: Scalar) -> 
         recv
     );
 
-    Ok(ClientSession {
-        stream,
-        cipher_tx,
-        cipher_rx,
-        nonce_tx_ctr,
-        nonce_rx_ctr,
-        established_at: Instant::now(),
-        sent,
-        recv,
-    })
-}
-
-fn do_auth_v2(server_addr: &str, device_id: [u8; 32], x: Scalar) -> std::io::Result<()> {
-    let mut sess = do_auth_v2_session(server_addr, device_id, x)?;
-    let goodbye = [MSG_GOODBYE];
-    let _ = sess.send_encrypted(&goodbye);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 
-fn run_online_session(mut session: ClientSession, heartbeat_interval: Duration) -> std::io::Result<()> {
-    let mut missed_heartbeats = 0u32;
-    println!("Client[ONLINE]: session established");
-    loop {
-        if session.established_at.elapsed() >= SESSION_MAX_AGE {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "session expired"));
-        }
-
-        let hb = [MSG_HEARTBEAT];
-        session.send_encrypted(&hb)?;
-        println!("Client[HB]: sent");
-        session.stream.set_read_timeout(Some(HEARTBEAT_ACK_TIMEOUT))?;
-        match session.recv_encrypted() {
-            Ok(msg) => {
-                if msg.len() == 1 && msg[0] == MSG_HEARTBEAT_ACK {
-                    println!("Client[HB]: ack");
-                    missed_heartbeats = 0;
-                } else if msg.len() == 1 && msg[0] == MSG_GOODBYE {
-                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "server closed session"));
-                } else {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected online message"));
-                }
-            }
-            Err(e) => {
-                missed_heartbeats = missed_heartbeats.saturating_add(1);
-                eprintln!("Client[HB]: missed {} ({})", missed_heartbeats, e);
-                if missed_heartbeats >= MAX_MISSED_HEARTBEATS {
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "heartbeat failure"));
-                }
-                continue;
-            }
-        }
-        session.stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        thread::sleep(heartbeat_interval);
-    }
+fn do_auth_v2(server_addr: &str, device_id: [u8; 32], x: Scalar) -> std::io::Result<()> {
+    do_auth_v2_session(server_addr, device_id, x)
 }
 
 #[derive(Debug, Clone)]
@@ -1336,7 +1216,6 @@ fn usage(prog: &str) {
         "Usage:
   {0} --server 127.0.0.1:4000 --setup [--pairing-token TOKEN] [--allow-tofu-setup (debug-only)]
   {0} --server 127.0.0.1:4000
-  {0} --server 127.0.0.1:4000 --daemon [--daemon-interval-secs N]
   {0} --pin-server-pub <hex>
   {0} --print-device-identity
   {0} --make-offline-proof <file> --audience <name> --scope <scope> [--offline-expires-in <1..300>] [--request-hash <hex>|--request-file <path>]",
@@ -1370,28 +1249,6 @@ fn recv_scalar(stream: &mut impl Read, recv: &mut usize) -> std::io::Result<Scal
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-canonical scalar"))
 }
 
-fn run_client_daemon(server_addr: &str, device_id: [u8; 32], heartbeat_interval: Duration) -> std::io::Result<()> {
-    let mut backoff = ReconnectBackoff::new(DAEMON_BASE_BACKOFF, DAEMON_MAX_BACKOFF);
-    loop {
-        let (_, x) = load_device_creds_from_root()?;
-        match do_auth_v2_session(server_addr, device_id, x) {
-            Ok(session) => {
-                backoff.reset(DAEMON_BASE_BACKOFF);
-                match run_online_session(session, heartbeat_interval) {
-                    Ok(()) => eprintln!("Client[DAEMON]: session closed cleanly"),
-                    Err(e) => eprintln!("Client[DAEMON]: session lost: {}", e),
-                }
-            }
-            Err(e) => {
-                eprintln!("Client[DAEMON]: connect/auth failed: {}", e);
-            }
-        }
-        let delay = backoff.next_delay();
-        eprintln!("Client[DAEMON]: reconnecting after {:?}", delay);
-        thread::sleep(delay);
-    }
-}
-
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let prog = args.get(0).cloned().unwrap_or_else(|| "client".to_string());
@@ -1405,7 +1262,6 @@ fn main() -> std::io::Result<()> {
     let mut offline_scope: Option<String> = None;
     let mut offline_expires_in: u64 = 300;
     let mut offline_request_hash: Option<[u8; 32]> = None;
-    let mut daemon_cfg = ClientDaemonConfig::default();
 
     let mut i = 1;
     while i < args.len() {
@@ -1415,15 +1271,7 @@ fn main() -> std::io::Result<()> {
                 server_addr = args[i + 1].clone();
                 i += 2;
             }
-            "--setup" => { do_setup_flag = true; i += 1; }
-            "--daemon" => { daemon_cfg.enabled = true; i += 1; }
-            "--daemon-interval-secs" => {
-                if i + 1 >= args.len() { usage(&prog); return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--daemon-interval-secs missing value")); }
-                let secs: u64 = args[i + 1].parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad --daemon-interval-secs"))?;
-                daemon_cfg.success_sleep = Duration::from_secs(secs.max(1));
-                i += 2;
-            }
-            "--print-device-identity" => { print_identity = true; i += 1; }
+            "--setup" => { do_setup_flag = true; i += 1; }            "--print-device-identity" => { print_identity = true; i += 1; }
             "--allow-tofu-setup" => {
                 if !cfg!(debug_assertions) {
                     return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "--allow-tofu-setup is disabled in production builds; pin the server key out-of-band instead"));
@@ -1506,10 +1354,8 @@ fn main() -> std::io::Result<()> {
     let (device_id, x) = load_device_creds_from_root()?;
 
     if do_setup_flag {
-        println!("Client[SETUP/RPK]: {}", if had_root_before { "Using existing device root for setup (idempotent)." } else { "No device root found; generating NEW device root." });
+        println!("Client[SETUP]: {}", if had_root_before { "Using existing device root for setup (idempotent)." } else { "No device root found; generating NEW device root." });
         do_setup(&server_addr, device_id, x, pairing_token.as_deref(), allow_tofu_setup)
-    } else if daemon_cfg.enabled {
-        run_client_daemon(&server_addr, device_id, daemon_cfg.success_sleep)
     } else {
         do_auth_v2(&server_addr, device_id, x)
     }

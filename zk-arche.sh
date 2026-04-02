@@ -31,13 +31,8 @@ CLIENT_CONTINUITY_PROOF_FILE="${GENERATED_DIR}/client_continuity_proof.bin"
 SERVER_CONTINUITY_PROOF_FILE="${GENERATED_DIR}/server_continuity_proof.bin"
 DEFAULT_CONTINUITY_EXPIRES_IN=300
 
-DEFAULT_DAEMON_INTERVAL_SECS=5
-DEFAULT_DAEMON_RUNTIME_SECS=30
-CLIENT_DAEMON_LOG="${GENERATED_DIR}/client-daemon.log"
 SERVER_LOG_FILE="${GENERATED_DIR}/server.log"
-SERVER_RESTART_LOG_FILE="${GENERATED_DIR}/server-restart.log"
 SERVER_PID_FILE="${GENERATED_DIR}/server.pid"
-CLIENT_DAEMON_PID_FILE="${GENERATED_DIR}/client-daemon.pid"
 
 IDENT_HELPER_SRC="${GENERATED_DIR}/.zk_arche_ident_helper.c"
 IDENT_HELPER_BIN="${GENERATED_DIR}/.zk_arche_ident_helper"
@@ -237,7 +232,7 @@ _status_file() {
 usage() {
   cat <<EOF2
 
-${_W}ZK-ARCHE automation script (RPK + ZKP edition, /var/lib/iot-auth layout)${_N}
+${_W}ZK-ARCHE automation script (one-shot RPK + ZKP edition, /var/lib/iot-auth layout)${_N}
 
 ${_C}USAGE${_N}
   ./zk-arche.sh <command> [options]
@@ -261,7 +256,6 @@ ${_C}SERVER COMMANDS${_N}
 ${_C}CLIENT COMMANDS${_N}
   setup-device <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
   auth-device <server_ip:port>
-  auth-device-daemon <server_ip:port> [--interval-secs <n>]
   make-offline-proof [--output <file>] [--audience <name>] [--scope <scope>] [--expires-in <1..300>] [--request-file <path>|--request-text <text>|--request-hash <hex>]
   make-client-continuity-proof [--output <file>] [--expires-in <1..300>]
   verify-server-continuity-proof [--proof <file>]
@@ -276,8 +270,6 @@ ${_C}OFFLINE TEST COMMANDS${_N}
 
 ${_C}COMBINED FLOWS${_N}
   client-local <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
-  client-daemon-local <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup] [--interval-secs <n>]
-  daemon-local <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup] [--interval-secs <n>] [--runtime-secs <n>]
   full-device-onboard <server_ip:port> [--pairing-token <token>] [--allow-tofu-setup]
   reset-all
 
@@ -287,7 +279,7 @@ ${_C}RECOMMENDED LOCAL TEST FLOW${_N}
   sudo ./zk-arche.sh init-rpk
   sudo ./zk-arche.sh server-local 127.0.0.1:4000
   sudo ./zk-arche.sh client-local 127.0.0.1:4000 --allow-tofu-setup
-  sudo ./zk-arche.sh auth-device-daemon 127.0.0.1:4000 --interval-secs 5
+  sudo ./zk-arche.sh auth-device 127.0.0.1:4000
   ./zk-arche.sh offline-local --request-text "cached telemetry payload"
   ./zk-arche.sh continuity-local
 
@@ -383,7 +375,7 @@ cmd_server_local() {
   echo
   log_info "In a second terminal run:"
   echo -e "    ${_Y}sudo ./zk-arche.sh client-local $bind_addr --allow-tofu-setup${_N}"
-  echo -e "    ${_Y}sudo ./zk-arche.sh auth-device-daemon $bind_addr --interval-secs 5${_N}"
+  echo -e "    ${_Y}sudo ./zk-arche.sh auth-device $bind_addr${_N}"
   echo
 
   cd "$SERVER_STATE_DIR"
@@ -454,40 +446,12 @@ cmd_auth_device() {
   require_bin "$CLIENT_BIN"
   [[ $# -eq 1 ]] || die "auth-device requires <server_ip:port>"
   ensure_existing_client_material
-  log_header "Device authentication"
+  log_header "Device authentication (one-shot)"
   log_info "Server: $1"
   sudo "$CLIENT_BIN" --server "$1"
   log_ok "Authentication complete"
 }
 
-cmd_auth_device_daemon() {
-  require_bin "$CLIENT_BIN"
-  [[ $# -ge 1 ]] || die "auth-device-daemon requires <server_ip:port>"
-
-  local server_addr="$1"; shift
-  local interval_secs="$DEFAULT_DAEMON_INTERVAL_SECS"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --interval-secs)
-        [[ $# -ge 2 ]] || die "--interval-secs requires a value"
-        interval_secs="$2"; shift 2 ;;
-      *)
-        die "auth-device-daemon: unknown option: $1" ;;
-    esac
-  done
-
-  ensure_existing_client_material
-
-  log_header "Device authentication daemon"
-  log_info "Server: $server_addr"
-  log_info "Interval: ${interval_secs}s"
-
-  sudo "$CLIENT_BIN" \
-    --server "$server_addr" \
-    --daemon \
-    --daemon-interval-secs "$interval_secs"
-}
 
 cmd_show_pinned_key() {
   if ! sudo test -f "$CLIENT_SERVER_PUB"; then
@@ -553,9 +517,7 @@ cmd_status() {
   if [[ -f "$OFFLINE_REQUEST_FILE" ]]; then _status_file "$OFFLINE_REQUEST_FILE" "offline request sample"; else log_warn "offline request sample: absent"; fi
   if [[ -f "$CLIENT_CONTINUITY_PROOF_FILE" ]]; then _status_file "$CLIENT_CONTINUITY_PROOF_FILE" "client continuity proof"; else log_warn "client continuity proof: absent"; fi
   if [[ -f "$SERVER_CONTINUITY_PROOF_FILE" ]]; then _status_file "$SERVER_CONTINUITY_PROOF_FILE" "server continuity proof"; else log_warn "server continuity proof: absent"; fi
-  if [[ -f "$CLIENT_DAEMON_LOG" ]]; then _status_file "$CLIENT_DAEMON_LOG" "client daemon log"; else log_warn "client daemon log: absent"; fi
   if [[ -f "$SERVER_LOG_FILE" ]]; then _status_file "$SERVER_LOG_FILE" "server log"; else log_warn "server log: absent"; fi
-  if [[ -f "$SERVER_RESTART_LOG_FILE" ]]; then _status_file "$SERVER_RESTART_LOG_FILE" "server restart log"; else log_warn "server restart log: absent"; fi
 }
 
 cmd_client_local() {
@@ -581,45 +543,12 @@ cmd_client_local() {
   log_step "Running device setup..."
   sudo "$CLIENT_BIN" --server "$server_addr" --setup "${pairing_token_flags[@]}"
   log_ok "Setup complete"
+
+  log_step "Running one-shot authentication..."
+  sudo "$CLIENT_BIN" --server "$server_addr"
+  log_ok "Authentication complete"
 }
 
-cmd_client_daemon_local() {
-  [[ $# -ge 1 ]] || die "client-daemon-local requires <server_ip:port>"
-
-  local server_addr="$1"; shift
-  local pairing_token_flags=()
-  local interval_secs="$DEFAULT_DAEMON_INTERVAL_SECS"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --pairing-token)
-        [[ $# -ge 2 ]] || die "--pairing-token requires a value"
-        pairing_token_flags+=(--pairing-token "$2"); shift 2 ;;
-      --allow-tofu-setup)
-        pairing_token_flags+=(--allow-tofu-setup); shift ;;
-      --interval-secs)
-        [[ $# -ge 2 ]] || die "--interval-secs requires a value"
-        interval_secs="$2"; shift 2 ;;
-      *)
-        die "client-daemon-local: unknown option: $1" ;;
-    esac
-  done
-
-  ensure_existing_demo_material
-
-  log_header "Local onboarding + daemon auth — client terminal"
-  log_info "Server: $server_addr"
-
-  log_step "Running device setup..."
-  sudo "$CLIENT_BIN" --server "$server_addr" --setup "${pairing_token_flags[@]}"
-  log_ok "Setup complete"
-
-  log_step "Starting client daemon..."
-  sudo "$CLIENT_BIN" \
-    --server "$server_addr" \
-    --daemon \
-    --daemon-interval-secs "$interval_secs"
-}
 
 cmd_full_device_onboard() {
   [[ $# -ge 1 ]] || die "full-device-onboard requires <server_ip:port>"
@@ -892,126 +821,12 @@ cmd_continuity_local() {
   cmd_verify_server_continuity_proof --proof "$SERVER_CONTINUITY_PROOF_FILE"
 }
 
-cmd_daemon_local() {
-  [[ $# -ge 1 ]] || die "daemon-local requires <server_ip:port>"
-
-  local bind_addr="$1"; shift
-  local pairing_token=""
-  local allow_tofu=0
-  local interval_secs="$DEFAULT_DAEMON_INTERVAL_SECS"
-  local runtime_secs="$DEFAULT_DAEMON_RUNTIME_SECS"
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --pairing-token)
-        [[ $# -ge 2 ]] || die "--pairing-token requires a value"
-        pairing_token="$2"; shift 2 ;;
-      --allow-tofu-setup)
-        allow_tofu=1; shift ;;
-      --interval-secs)
-        [[ $# -ge 2 ]] || die "--interval-secs requires a value"
-        interval_secs="$2"; shift 2 ;;
-      --runtime-secs)
-        [[ $# -ge 2 ]] || die "--runtime-secs requires a value"
-        runtime_secs="$2"; shift 2 ;;
-      *)
-        die "daemon-local: unknown option: $1" ;;
-    esac
-  done
-
-  ensure_existing_demo_material
-  ensure_state_dirs
-  mkdir -p "$GENERATED_DIR"
-
-  local server_flags=(--bind "$bind_addr" --pairing)
-  if [[ -n "$pairing_token" ]]; then
-    server_flags+=(--pairing-token "$pairing_token")
-  fi
-
-  local setup_flags=(--server "$bind_addr" --setup)
-  if [[ -n "$pairing_token" ]]; then
-    setup_flags+=(--pairing-token "$pairing_token")
-  fi
-  if [[ "$allow_tofu" -eq 1 ]]; then
-    setup_flags+=(--allow-tofu-setup)
-  fi
-
-  log_header "Automated daemon continuity test"
-  log_info "Bind: $bind_addr"
-  log_info "Daemon interval: ${interval_secs}s"
-  log_info "Runtime after restart: ${runtime_secs}s"
-  log_info "Client log: $CLIENT_DAEMON_LOG"
-
-  rm -f "$CLIENT_DAEMON_LOG" "$SERVER_LOG_FILE" "$SERVER_RESTART_LOG_FILE" \
-        "$SERVER_PID_FILE" "$CLIENT_DAEMON_PID_FILE"
-
-  cleanup() {
-    if [[ -f "$CLIENT_DAEMON_PID_FILE" ]]; then
-      local cpid
-      cpid="$(cat "$CLIENT_DAEMON_PID_FILE" 2>/dev/null || true)"
-      [[ -n "$cpid" ]] && sudo kill "$cpid" 2>/dev/null || true
-      rm -f "$CLIENT_DAEMON_PID_FILE"
-    fi
-    if [[ -f "$SERVER_PID_FILE" ]]; then
-      local spid
-      spid="$(cat "$SERVER_PID_FILE" 2>/dev/null || true)"
-      [[ -n "$spid" ]] && sudo kill "$spid" 2>/dev/null || true
-      rm -f "$SERVER_PID_FILE"
-    fi
-  }
-  trap cleanup EXIT
-
-  log_step "Starting server in background..."
-  (
-    cd "$SERVER_STATE_DIR"
-    sudo "$SERVER_BIN" "${server_flags[@]}"
-  ) > "$SERVER_LOG_FILE" 2>&1 &
-  echo $! > "$SERVER_PID_FILE"
-  sleep 2
-
-  log_step "Onboarding client..."
-  sudo "$CLIENT_BIN" "${setup_flags[@]}"
-  log_ok "Client setup complete"
-
-  log_step "Starting client daemon in background..."
-  sudo "$CLIENT_BIN" \
-    --server "$bind_addr" \
-    --daemon \
-    --daemon-interval-secs "$interval_secs" \
-    > "$CLIENT_DAEMON_LOG" 2>&1 &
-  echo $! > "$CLIENT_DAEMON_PID_FILE"
-  sleep $(( interval_secs + 2 ))
-
-  log_step "Stopping server to simulate outage..."
-  sudo kill "$(cat "$SERVER_PID_FILE")"
-  rm -f "$SERVER_PID_FILE"
-  sleep $(( interval_secs * 2 + 2 ))
-
-  log_step "Restarting server..."
-  (
-    cd "$SERVER_STATE_DIR"
-    sudo "$SERVER_BIN" "${server_flags[@]}"
-  ) > "$SERVER_RESTART_LOG_FILE" 2>&1 &
-  echo $! > "$SERVER_PID_FILE"
-
-  log_step "Waiting for client daemon to reconnect..."
-  sleep "$runtime_secs"
-
-  log_ok "Daemon test finished"
-  log_val "Client daemon log:" "$CLIENT_DAEMON_LOG"
-  log_val "Server initial log:" "$SERVER_LOG_FILE"
-  log_val "Server restart log:" "$SERVER_RESTART_LOG_FILE"
-
-  echo
-  log_info "Last 40 lines of client daemon log:"
-  tail -n 40 "$CLIENT_DAEMON_LOG" || true
-}
 
 cmd_reset_client() {
   log_warn "Resetting client state: $CLIENT_STATE_DIR"
   sudo rm -rf "$CLIENT_STATE_DIR"
   rm -f "$OFFLINE_PROOF_FILE" "$OFFLINE_REQUEST_FILE" "$CLIENT_CONTINUITY_PROOF_FILE" \
-        "$SERVER_CONTINUITY_PROOF_FILE" "$CLIENT_DAEMON_LOG" "$CLIENT_DAEMON_PID_FILE"
+        "$SERVER_CONTINUITY_PROOF_FILE"
   sudo mkdir -p "$CLIENT_STATE_DIR"
   sudo chmod 700 "$CLIENT_STATE_DIR"
   log_ok "Client state removed"
@@ -1028,7 +843,7 @@ cmd_reset_server() {
              "$SERVER_OFFLINE_COUNTERS"
   rm -f "$OFFLINE_PROOF_FILE" "$OFFLINE_REQUEST_FILE" "$CLIENT_CONTINUITY_PROOF_FILE" \
         "$SERVER_CONTINUITY_PROOF_FILE" "$IDENT_HELPER_SRC" "$IDENT_HELPER_BIN" \
-        "$SERVER_LOG_FILE" "$SERVER_RESTART_LOG_FILE" "$SERVER_PID_FILE"
+        "$SERVER_LOG_FILE" "$SERVER_PID_FILE"
   log_ok "Server state removed"
 }
 
@@ -1055,7 +870,6 @@ main() {
     pin-server) cmd_pin_server "$@" ;;
     setup-device) cmd_setup_device "$@" ;;
     auth-device) cmd_auth_device "$@" ;;
-    auth-device-daemon) cmd_auth_device_daemon "$@" ;;
     make-offline-proof) cmd_make_offline_proof "$@" ;;
     verify-offline-proof) cmd_verify_offline_proof "$@" ;;
     offline-local) cmd_offline_local "$@" ;;
@@ -1067,8 +881,6 @@ main() {
     show-pinned-key) cmd_show_pinned_key "$@" ;;
     status) cmd_status "$@" ;;
     client-local) cmd_client_local "$@" ;;
-    client-daemon-local) cmd_client_daemon_local "$@" ;;
-    daemon-local) cmd_daemon_local "$@" ;;
     full-device-onboard) cmd_full_device_onboard "$@" ;;
     reset-client) cmd_reset_client "$@" ;;
     reset-server) cmd_reset_server "$@" ;;

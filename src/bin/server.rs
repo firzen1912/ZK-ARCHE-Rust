@@ -33,8 +33,6 @@ const SETUP_CHALLENGE_LEN: usize = 16;
 
 const MSG_SETUP: u8 = 0x01;
 const MSG_AUTH_V2: u8 = 0x03;
-const MSG_HEARTBEAT: u8 = 0x10;
-const MSG_HEARTBEAT_ACK: u8 = 0x11;
 const MSG_GOODBYE: u8 = 0x15;
 
 const REGISTRY_BIN: &str = "/var/lib/iot-auth/server/registry.bin";
@@ -52,7 +50,6 @@ const T_OFFLINE: &[u8] = b"offline_schnorr_v1";
 const T_ATTR_ROLE: &[u8] = b"client_attr_role_v1";
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const ONLINE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 const MAX_ENCRYPTED_PAYLOAD: usize = 4096;
 
@@ -772,38 +769,6 @@ impl PairingPolicy {
     }
 }
 
-struct ServerSession {
-    stream: TcpStream,
-    cipher_tx: ChaCha20Poly1305,
-    cipher_rx: ChaCha20Poly1305,
-    nonce_tx_ctr: NonceCounter,
-    nonce_rx_ctr: NonceCounter,
-    sent: usize,
-    recv: usize,
-    device_id: [u8; 32],
-    last_rx: Instant,
-}
-
-impl ServerSession {
-    fn send_encrypted(&mut self, payload: &[u8]) -> std::io::Result<()> {
-        let ct = self.cipher_tx
-            .encrypt(&self.nonce_tx_ctr.next(), payload)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "session encrypt failed"))?;
-        send_blob(&mut self.stream, &ct, &mut self.sent)?;
-        self.stream.flush()?;
-        Ok(())
-    }
-
-    fn recv_encrypted(&mut self) -> std::io::Result<Vec<u8>> {
-        let ct = recv_encrypted_blob(&mut self.stream, &mut self.recv)?;
-        let pt = self.cipher_rx
-            .decrypt(&self.nonce_rx_ctr.next(), ct.as_ref())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "session decrypt failed"))?;
-        self.last_rx = Instant::now();
-        Ok(pt)
-    }
-}
-
 #[derive(Clone)]
 /// Tracks recent failures for one peer so the server can rate-limit abusive sources.
 struct FailureState {
@@ -1207,7 +1172,7 @@ fn handle_auth_v2(
     recv: &mut usize,
     failures: &Arc<Mutex<FailureTracker>>,
     peer_key: &str,
-) -> std::io::Result<ServerSession> {
+) -> std::io::Result<()> {
     let mut client_pk_bytes = [0u8; 32];
     recv_exact(&mut stream, &mut client_pk_bytes, recv)?;
     let client_pk = X25519Public::from(client_pk_bytes);
@@ -1327,6 +1292,35 @@ fn handle_auth_v2(
         ));
     }
 
+    if role_commitment.compress().to_bytes() != record.role_commitment.compress().to_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "role commitment mismatch",
+        ));
+    }
+
+    if !verify_role_commitment_opening(
+        &role_commitment,
+        &attr_a,
+        &attr_s_attr,
+        &attr_s_blind,
+        &device_id,
+        &nonce_c,
+        &eph_c,
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "attribute proof invalid",
+        ));
+    }
+
+    if record.role_code != 1u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "device role not authorized",
+        ));
+    }
+
     let nonce_s = random_bytes_32();
     let mut eph_s_secret = random_scalar();
     let eph_s = RISTRETTO_BASEPOINT_POINT * eph_s_secret;
@@ -1398,43 +1392,9 @@ fn handle_auth_v2(
     tx_key.zeroize();
     rx_key.zeroize();
     x25519_shared_bytes.zeroize();
-    Ok(ServerSession {
-        stream,
-        cipher_tx,
-        cipher_rx,
-        nonce_tx_ctr,
-        nonce_rx_ctr,
-        sent: *sent,
-        recv: *recv,
-        device_id,
-        last_rx: Instant::now(),
-    })
-}
-
-fn run_server_session(mut session: ServerSession) -> std::io::Result<(usize, usize)> {
-    println!("Server[ONLINE]: session established for {}", hex::encode(session.device_id));
-    session.stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    loop {
-        if session.last_rx.elapsed() >= ONLINE_IDLE_TIMEOUT {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "client idle timeout"));
-        }
-        let msg = session.recv_encrypted()?;
-        if msg.len() != 1 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected online payload"));
-        }
-        match msg[0] {
-            MSG_HEARTBEAT => {
-                println!("Server[HB]: heartbeat from {}", hex::encode(session.device_id));
-                let ack = [MSG_HEARTBEAT_ACK];
-                session.send_encrypted(&ack)?;
-            }
-            MSG_GOODBYE => break,
-            other => {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unexpected online message: 0x{other:02x}")));
-            }
-        }
-    }
-    Ok((session.sent, session.recv))
+    println!("Server[ONLINE]: one-shot session completed for {}", hex::encode(device_id));
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
 }
 
 /// Dispatches one inbound TCP client connection to the appropriate protocol handler.
@@ -1489,12 +1449,7 @@ fn handle_client(
         MSG_AUTH_V2 => handle_auth_v2(
             stream, &server_static_secret, &server_static_pub,
             &reg, &replay, &mut sent, &mut recv_bytes, &failures, &peer_key,
-        ).and_then(|session| {
-            let (final_sent, final_recv) = run_server_session(session)?;
-            sent = final_sent;
-            recv_bytes = final_recv;
-            Ok(())
-        }),
+        ),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown msg_type: 0x{msg_type:02x}"),
